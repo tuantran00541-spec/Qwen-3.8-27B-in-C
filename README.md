@@ -4,6 +4,83 @@ Experimental CPU-only runtime for **Qwen/Qwen3.8-27B** that keeps the model prim
 
 The repository contains native C kernels plus Python orchestration used to develop and verify the runtime. It is **not yet a polished llama.cpp/Ollama-style application**: the current text-generation entry point is developer-facing and greedy-only, while the fastest native-Windows path is currently exposed as an exact validation/profile runner.
 
+## Read this first if you are on Windows
+
+The current easiest text-generation path is **Ubuntu inside WSL2**.
+
+Do **not** paste commands such as `sudo apt update` into ordinary Windows PowerShell. `sudo` and `apt` are Linux commands.
+
+From PowerShell, first inspect the installed WSL distributions:
+
+```powershell
+wsl -l -v
+```
+
+You want an Ubuntu distribution running as **WSL version 2**, for example:
+
+```text
+  NAME              STATE           VERSION
+* Ubuntu            Running         2
+  docker-desktop    Stopped         2
+```
+
+If Ubuntu is already installed, enter it explicitly:
+
+```powershell
+wsl -d Ubuntu
+```
+
+If its name is different, such as `Ubuntu-24.04`, use that exact name:
+
+```powershell
+wsl -d Ubuntu-24.04
+```
+
+If Ubuntu is not listed, open PowerShell as Administrator and install it:
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+Restart Windows if requested, open Ubuntu once to finish the first-time username/password setup, then optionally make it the default WSL distribution:
+
+```powershell
+wsl --set-default Ubuntu
+```
+
+After entering WSL, verify that you are actually inside Ubuntu:
+
+```bash
+cat /etc/os-release
+```
+
+It should identify itself as Ubuntu.
+
+If plain `wsl` drops you into another backend or utility distribution instead, exit it:
+
+```bash
+exit
+```
+
+Then use `wsl -l -v` in PowerShell and enter Ubuntu explicitly with `wsl -d <Ubuntu-name>`.
+
+A path such as `/mnt/host/c/...` is **not** where this README recommends running the model. Likewise, although Ubuntu can access your Windows files under `/mnt/c/...`, the current K3 runtime is I/O-sensitive.
+
+For the quick start below, clone and run the repository **inside the Ubuntu filesystem**, under your Linux home directory, for example:
+
+```text
+/home/your-user/Qwen-3.8-27B-in-C
+```
+
+rather than:
+
+```text
+/mnt/c/Users/your-user/Qwen-3.8-27B-in-C
+/mnt/host/c/Users/your-user/Qwen-3.8-27B-in-C
+```
+
+Keeping a separate Windows clone is fine; just do not use that mounted copy for the current Linux/WSL generation path unless you deliberately want to test mounted-filesystem I/O behavior.
+
 ## What works today
 
 - Qwen3.8-27B Q6_K_L GGUF parsing and contract validation.
@@ -35,32 +112,58 @@ Recommended for the current runtime:
 
 The project was designed around a 16 GB RAM consumer laptop. The proven hosted current-best Windows profile stayed around ~1 GiB process RSS, but your OS cache, filesystem and other applications still consume memory, so treat that number as a runtime measurement rather than a total-system RAM guarantee.
 
-## Quick start: generate text on Linux / WSL2
+## Quick start: generate text on Ubuntu / WSL2
 
-This is the shortest currently supported path from a clean clone to generated text.
+All commands in this section are Linux commands and must be run **inside Ubuntu**, not in Windows PowerShell.
 
-### 1. Clone the repository
+### 1. Install the required packages
 
 ```bash
+sudo apt update
+sudo apt install -y python3 python3-venv clang git
+```
+
+### 2. Clone the repository inside the Ubuntu filesystem
+
+Start from your Linux home directory:
+
+```bash
+cd ~
 git clone https://github.com/tuantran00541-spec/Qwen-3.8-27B-in-C.git
 cd Qwen-3.8-27B-in-C
 ```
 
-### 2. Install Python and build dependencies
-
-Ubuntu / WSL2:
+Check where you are:
 
 ```bash
-sudo apt update
-sudo apt install -y python3 python3-venv clang
+pwd
+```
 
+A good result looks similar to:
+
+```text
+/home/your-user/Qwen-3.8-27B-in-C
+```
+
+Avoid running the model from `/mnt/c/...` or `/mnt/host/c/...` for this quick start.
+
+### 3. Create the Python environment
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install tokenizers huggingface_hub hf_xet
 ```
 
-### 3. Download the pinned GGUF and official tokenizer
+When you open a new Ubuntu terminal later, reactivate the environment with:
+
+```bash
+cd ~/Qwen-3.8-27B-in-C
+source .venv/bin/activate
+```
+
+### 4. Download the pinned GGUF and official tokenizer
 
 ```bash
 mkdir -p models
@@ -100,7 +203,7 @@ sha256sum models/Qwen3.8-27B-Q6_K_L.gguf
 
 Do not continue if the hash differs.
 
-### 4. Build the minimal native libraries
+### 5. Build the minimal native libraries
 
 The basic generator needs the scalar Q6_K/Q8_0 quantized matvec bridge and the recurrent GDN state kernel.
 
@@ -120,7 +223,7 @@ clang -O3 -std=c11 -shared -fPIC \
 
 Do **not** add `-ffast-math`: exact arithmetic behavior is part of the validated runtime contract.
 
-### 5. Run code sanity checks
+### 6. Run code sanity checks
 
 ```bash
 export PYTHONPATH="$PWD/qwen38"
@@ -129,7 +232,7 @@ python -u qwen38/qwen35_gguf_decoder_contract.py sanity
 python -u qwen38/qwen35_k3_generate.py sanity
 ```
 
-### 6. Validate the real GGUF and create its inventory
+### 7. Validate the real GGUF and create its inventory
 
 This reads and hashes the real model, then checks all 64 decoder layers, tensor roles, shapes and mixed quantization types.
 
@@ -141,7 +244,7 @@ python -u qwen38/qwen35_gguf_decoder_contract.py real \
 
 `work/inventory.json` must report `"status": "PASS"` and the pinned SHA256 before generation.
 
-### 7. Generate text
+### 8. Generate text
 
 ```bash
 python -u qwen38/qwen35_k3_generate.py run \
@@ -164,7 +267,9 @@ If you already constructed the exact chat-template text yourself, add `--raw-pro
 
 ### WSL storage note
 
-The K3 reader prefers direct I/O when the filesystem supports it and falls back to buffered reads when it does not. For better I/O behavior, keep the model and `work/` directory on a fast filesystem/SSD. Files under `/mnt/c/...` may behave differently from files inside the WSL ext4 virtual disk.
+The K3 reader prefers direct I/O when the filesystem supports it and falls back to buffered reads when it does not. For better I/O behavior, keep the repository, model and `work/` directory inside the Ubuntu filesystem on the WSL virtual disk when following this quick start.
+
+Windows-mounted paths such as `/mnt/c/...` can have different filesystem and I/O behavior. `/mnt/host/c/...` usually indicates that you are not following the intended Ubuntu quick-start environment at all; verify your active WSL distribution before continuing.
 
 ## Native Windows status
 
@@ -192,7 +297,7 @@ python -u qwen38\qwen38_win32_bootstrap.py
 python -u qwen38\qwen38_progressive_current_best_profile_win32.py sanity
 ```
 
-However, that path expects the complete native DLL bundle (`qwen_quant_base.dll`, portable Q6 pool, GDN/attention/RMSNorm helpers, Win32 direct-I/O DLL, expf compatibility DLL, etc.). A standalone build-and-run PowerShell wrapper has not been packaged yet, so **for text generation today, use the Linux/WSL quick start above**. The next packaging milestone is a native-Windows launcher that builds/locates those DLLs and exposes the current-best stack as a normal chat/generation command.
+However, that path expects the complete native DLL bundle (`qwen_quant_base.dll`, portable Q6 pool, GDN/attention/RMSNorm helpers, Win32 direct-I/O DLL, expf compatibility DLL, etc.). A standalone build-and-run PowerShell wrapper has not been packaged yet, so **for text generation today, use the Ubuntu/WSL2 quick start above**. The next packaging milestone is a native-Windows launcher that builds/locates those DLLs and exposes the current-best stack as a normal chat/generation command.
 
 Do not run the raw Linux generator directly from ordinary Windows Python and assume it is equivalent to the verified Win32 path: the Windows adapter provides platform-specific positional reads, direct I/O and exact `expf` plumbing.
 
