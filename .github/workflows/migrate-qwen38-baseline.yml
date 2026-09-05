@@ -35,21 +35,20 @@ jobs:
             exit 1
           fi
 
-          rm -rf research/qwen38
-          mkdir -p research
-          cp -a "$SRC/research/qwen38" research/qwen38
+          rm -rf qwen38
+          cp -a "$SRC/research/qwen38" qwen38
 
-          git add research/qwen38
+          git add qwen38
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
           if git diff --cached --quiet; then
-            echo 'Pinned Qwen38 subtree is already present; nothing to migrate.'
+            echo 'Pinned Qwen38 subtree is already present at repository root; nothing to migrate.'
             exit 0
           fi
 
-          git commit -m 'migrate exact Qwen3.8 runtime baseline from manga-translator'
-          target_subtree="$(git rev-parse HEAD:research/qwen38)"
+          git commit -m 'restore exact Qwen3.8 runtime baseline at repository root'
+          target_subtree="$(git rev-parse HEAD:qwen38)"
           if [ "$target_subtree" != "$EXPECTED_SUBTREE" ]; then
             echo "target subtree mismatch: $target_subtree != $EXPECTED_SUBTREE" >&2
             exit 1
@@ -57,5 +56,5 @@ jobs:
 
           echo "source_commit=$SOURCE_COMMIT"
           echo "qwen38_subtree=$target_subtree"
-          echo "file_count=$(git ls-tree -r --name-only HEAD research/qwen38 | wc -l)"
+          echo "file_count=$(git ls-tree -r --name-only HEAD qwen38 | wc -l)"
           git push origin HEAD:main
