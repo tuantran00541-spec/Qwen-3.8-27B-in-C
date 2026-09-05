@@ -1,0 +1,65 @@
+name: Migrate pinned Qwen38 baseline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/migrate-qwen38-baseline.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout standalone repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Copy exact pinned Qwen38 subtree
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_REPO='https://github.com/tuantran00541-spec/manga-translator.git'
+          SOURCE_COMMIT='8f378cf13786e5e62b64ba540e3a187e351b2160'
+          EXPECTED_SUBTREE='a0e03e8bffc282e30aa3b0664b039f99c6bcead9'
+          SRC="$RUNNER_TEMP/qwen38-source"
+
+          git clone --filter=blob:none --no-checkout "$SOURCE_REPO" "$SRC"
+          git -C "$SRC" sparse-checkout init --cone
+          git -C "$SRC" sparse-checkout set research/qwen38
+          git -C "$SRC" checkout --detach "$SOURCE_COMMIT"
+
+          source_subtree="$(git -C "$SRC" rev-parse "$SOURCE_COMMIT:research/qwen38")"
+          if [ "$source_subtree" != "$EXPECTED_SUBTREE" ]; then
+            echo "source subtree mismatch: $source_subtree != $EXPECTED_SUBTREE" >&2
+            exit 1
+          fi
+
+          rm -rf research/qwen38
+          mkdir -p research
+          cp -a "$SRC/research/qwen38" research/qwen38
+
+          git add research/qwen38
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          if git diff --cached --quiet; then
+            echo 'Pinned Qwen38 subtree is already present; nothing to migrate.'
+            exit 0
+          fi
+
+          git commit -m 'migrate exact Qwen3.8 runtime baseline from manga-translator'
+          target_subtree="$(git rev-parse HEAD:research/qwen38)"
+          if [ "$target_subtree" != "$EXPECTED_SUBTREE" ]; then
+            echo "target subtree mismatch: $target_subtree != $EXPECTED_SUBTREE" >&2
+            exit 1
+          fi
+
+          echo "source_commit=$SOURCE_COMMIT"
+          echo "qwen38_subtree=$target_subtree"
+          echo "file_count=$(git ls-tree -r --name-only HEAD research/qwen38 | wc -l)"
+          git push origin HEAD:main
