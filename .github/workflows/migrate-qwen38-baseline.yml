@@ -3,8 +3,6 @@ name: Migrate pinned Qwen38 baseline
 on:
   push:
     branches: [main]
-    paths:
-      - '.github/workflows/migrate-qwen38-baseline.yml'
   workflow_dispatch:
 
 permissions:
