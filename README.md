@@ -42,8 +42,10 @@ The migration baseline preserves these constraints:
 - Q8 no-allocation path enabled
 - no fast-math / reassociation / FMA contraction changes to the exact arithmetic path
 
-## Repository state
+## Repository layout
 
-The first migration intentionally keeps the proven source layout under `research/qwen38/`. This avoids changing imports and runtime paths while separating the project from the manga application. Cleanup into a user-facing `src/`/`runtime/` layout should happen only after the migrated baseline is re-gated in this repository.
+The exact migrated runtime now lives directly under `qwen38/` at the repository root. The extra `research/` nesting from the original monorepo has been removed without changing the Qwen38 subtree contents.
+
+The migrated `qwen38/` tree remains byte-for-byte identical to the proven source subtree (`a0e03e8bffc282e30aa3b0664b039f99c6bcead9`). Future cleanup into a smaller user-facing runtime layout should be gated separately so the proven baseline stays recoverable.
 
 Large model weights are not committed to Git.
