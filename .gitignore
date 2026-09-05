@@ -1,0 +1,10 @@
+.venv/
+build/
+models/
+work/
+__pycache__/
+*.py[cod]
+*.dll
+*.obj
+*.lib
+*.exp
