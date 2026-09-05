@@ -1,0 +1,43 @@
+name: Native Windows package sanity
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - runtime/win32_generate.py
+      - scripts/build_win32.ps1
+      - scripts/download_model.ps1
+      - setup.ps1
+      - run.ps1
+      - chat.ps1
+      - .github/workflows/win32-package-sanity.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  win32-package-sanity:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build exact native Windows DLL bundle
+        shell: pwsh
+        run: .\scripts\build_win32.ps1
+
+      - name: Run native Windows launcher sanity
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "$PWD\qwen38"
+          $env:QWEN38_EXPF_COMPAT_LIB = "$PWD\build\win32\qwen_glibc_expf_compat.dll"
+          python -m py_compile runtime\win32_generate.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -u runtime\win32_generate.py sanity --build-dir build\win32
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
