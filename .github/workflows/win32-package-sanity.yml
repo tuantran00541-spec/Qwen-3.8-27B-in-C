@@ -45,7 +45,7 @@ jobs:
             [System.Management.Automation.Language.Parser]::ParseFile(
               (Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors.Count -gt 0) {
-              $errors | ForEach-Object { Write-Error "$file: $($_.Message)" }
+              $errors | ForEach-Object { Write-Error "${file}: $($_.Message)" }
               throw "PowerShell parse failed for $file"
             }
           }
