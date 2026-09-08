@@ -17,31 +17,39 @@ if (-not $curl) {
     throw 'curl.exe was not found. Windows 10/11 normally includes it.'
 }
 
+function Get-Sha256Lower([string]$Path) {
+    return (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
+}
+
+function Move-BadDownload([string]$Path, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $null
+    }
+    $bad = "$Path.bad.$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss'))"
+    Move-Item -LiteralPath $Path -Destination $bad -Force
+    Write-Warning "$Label failed integrity validation; moved it to $bad"
+    return $bad
+}
+
 $ModelName = 'Qwen3.8-27B-Q6_K_L.gguf'
 $ModelPath = Join-Path $ModelDir $ModelName
 $ModelPart = "$ModelPath.part"
 $ExpectedSha = 'a487690b9f17de581857c4ae484dab50800335bb9eb978a4fb02c0465629dc0a'
 $ModelUrl = 'https://huggingface.co/bartowski/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q6_K_L.gguf?download=true'
 
-function Get-Sha256Lower([string]$Path) {
-    return (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
-}
-
-if (Test-Path $ModelPath) {
+if (Test-Path -LiteralPath $ModelPath -PathType Leaf) {
     Write-Host 'Existing GGUF found; verifying SHA256...'
     $actual = Get-Sha256Lower $ModelPath
     if ($actual -eq $ExpectedSha) {
         Write-Host 'Pinned GGUF already present and valid.'
     } else {
-        $bad = "$ModelPath.bad.$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss'))"
-        Move-Item -Force $ModelPath $bad
-        Write-Warning "Existing GGUF hash was wrong; moved it to $bad"
+        Move-BadDownload $ModelPath 'Existing GGUF' | Out-Null
     }
 }
 
-if (-not (Test-Path $ModelPath)) {
-    if (Test-Path $ModelPart) {
-        $size = (Get-Item $ModelPart).Length
+if (-not (Test-Path -LiteralPath $ModelPath -PathType Leaf)) {
+    if (Test-Path -LiteralPath $ModelPart -PathType Leaf) {
+        $size = (Get-Item -LiteralPath $ModelPart).Length
         Write-Host "Resuming GGUF download from existing partial file ($size bytes)."
     } else {
         Write-Host 'Starting resumable GGUF download.'
@@ -63,15 +71,35 @@ if (-not (Test-Path $ModelPath)) {
     Write-Host 'Download finished; verifying pinned GGUF SHA256...'
     $actual = Get-Sha256Lower $ModelPart
     if ($actual -ne $ExpectedSha) {
-        throw "GGUF SHA mismatch actual=$actual expected=$ExpectedSha. Partial file was kept: $ModelPart"
+        $bad = Move-BadDownload $ModelPart 'Downloaded GGUF'
+        throw "GGUF SHA mismatch actual=$actual expected=$ExpectedSha. Corrupt completed download was quarantined at: $bad. Rerun the script to start a clean download."
     }
-    Move-Item -Force $ModelPart $ModelPath
+    Move-Item -LiteralPath $ModelPart -Destination $ModelPath -Force
 }
 
 $TokenizerPath = Join-Path $ModelDir 'qwen-official\tokenizer.json'
+$TokenizerPart = "$TokenizerPath.part"
+$TokenizerSha = '0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3'
 $TokenizerUrl = 'https://huggingface.co/Qwen/Qwen3.8-27B/resolve/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/tokenizer.json?download=true'
-if (-not (Test-Path $TokenizerPath)) {
-    $TokenizerPart = "$TokenizerPath.part"
+
+if (Test-Path -LiteralPath $TokenizerPath -PathType Leaf) {
+    Write-Host 'Existing pinned tokenizer found; verifying SHA256...'
+    $actualTokenizer = Get-Sha256Lower $TokenizerPath
+    if ($actualTokenizer -eq $TokenizerSha) {
+        Write-Host 'Pinned tokenizer already present and valid.'
+    } else {
+        Move-BadDownload $TokenizerPath 'Existing tokenizer' | Out-Null
+    }
+}
+
+if (-not (Test-Path -LiteralPath $TokenizerPath -PathType Leaf)) {
+    if (Test-Path -LiteralPath $TokenizerPart -PathType Leaf) {
+        $size = (Get-Item -LiteralPath $TokenizerPart).Length
+        Write-Host "Resuming tokenizer download from existing partial file ($size bytes)."
+    } else {
+        Write-Host 'Starting resumable pinned tokenizer download.'
+    }
+
     & $curl.Source `
         --fail `
         --location `
@@ -82,9 +110,15 @@ if (-not (Test-Path $TokenizerPath)) {
         --output $TokenizerPart `
         $TokenizerUrl
     if ($LASTEXITCODE -ne 0) {
-        throw "curl tokenizer download failed rc=$LASTEXITCODE"
+        throw "curl tokenizer download failed rc=$LASTEXITCODE. The .part file was kept for resume."
     }
-    Move-Item -Force $TokenizerPart $TokenizerPath
+
+    $actualTokenizer = Get-Sha256Lower $TokenizerPart
+    if ($actualTokenizer -ne $TokenizerSha) {
+        $bad = Move-BadDownload $TokenizerPart 'Downloaded tokenizer'
+        throw "Tokenizer SHA mismatch actual=$actualTokenizer expected=$TokenizerSha. Corrupt completed download was quarantined at: $bad. Rerun the script to start a clean download."
+    }
+    Move-Item -LiteralPath $TokenizerPart -Destination $TokenizerPath -Force
 }
 
 Write-Host "GGUF: $ModelPath"

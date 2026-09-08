@@ -28,6 +28,29 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Parse user-facing PowerShell scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(
+            'setup.ps1',
+            'run.ps1',
+            'chat.ps1',
+            'scripts\build_win32.ps1',
+            'scripts\download_model.ps1'
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$file: $($_.Message)" }
+              throw "PowerShell parse failed for $file"
+            }
+          }
+          Write-Host 'QWEN38_WINDOWS_POWERSHELL_PARSE_PASS'
+
       - name: Build exact native Windows DLL bundle
         shell: pwsh
         run: .\scripts\build_win32.ps1

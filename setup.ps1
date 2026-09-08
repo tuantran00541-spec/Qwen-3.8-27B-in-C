@@ -7,25 +7,53 @@ $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 Set-Location $Root
 
+function Test-PythonCandidate {
+    param(
+        [string]$Exe,
+        [string[]]$Prefix = @()
+    )
+    if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+        return $false
+    }
+    $probeArgs = @()
+    $probeArgs += $Prefix
+    $probeArgs += @(
+        '-c',
+        'import struct,sys; raise SystemExit(0 if sys.version_info >= (3,10) and struct.calcsize("P") == 8 else 1)'
+    )
+    & $Exe @probeArgs *> $null
+    return $LASTEXITCODE -eq 0
+}
+
 function Resolve-Python {
+    $candidates = @()
     $py = Get-Command py.exe -ErrorAction SilentlyContinue
     if ($py) {
-        return @{ Exe = $py.Source; Prefix = @('-3') }
+        foreach ($version in @('3.12', '3.11', '3.10')) {
+            $candidates += @{ Exe = $py.Source; Prefix = @("-$version") }
+        }
     }
+
     $python = Get-Command python.exe -ErrorAction SilentlyContinue
     if ($python) {
-        return @{ Exe = $python.Source; Prefix = @() }
+        $candidates += @{ Exe = $python.Source; Prefix = @() }
     }
-    $candidates = @(
-        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Launcher\py.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe')
-    )
+
+    $launcher = Join-Path $env:LOCALAPPDATA 'Programs\Python\Launcher\py.exe'
+    if (Test-Path -LiteralPath $launcher -PathType Leaf) {
+        foreach ($version in @('3.12', '3.11', '3.10')) {
+            $candidates += @{ Exe = $launcher; Prefix = @("-$version") }
+        }
+    }
+
+    $python312 = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
+    if (Test-Path -LiteralPath $python312 -PathType Leaf) {
+        $candidates += @{ Exe = $python312; Prefix = @() }
+    }
+
     foreach ($candidate in $candidates) {
-        if (Test-Path $candidate) {
-            if ($candidate.EndsWith('py.exe')) {
-                return @{ Exe = $candidate; Prefix = @('-3') }
-            }
-            return @{ Exe = $candidate; Prefix = @() }
+        if (Test-PythonCandidate -Exe $candidate.Exe -Prefix $candidate.Prefix) {
+            return $candidate
         }
     }
     return $null
@@ -43,16 +71,25 @@ function Install-WingetPackage([string]$Id) {
     }
 }
 
+try {
+    $drive = (Get-Item -LiteralPath $Root).PSDrive
+    if ($drive -and $null -ne $drive.Free -and [int64]$drive.Free -lt 60GB) {
+        Write-Warning "The repository drive has less than 60 GB free. The ~24 GB GGUF plus the ~21 GB K3 trunk need substantial SSD headroom."
+    }
+} catch {
+    Write-Verbose "Could not query repository drive free space: $_"
+}
+
 $python = Resolve-Python
 if (-not $python) {
     if ($NoInstallTools) {
-        throw 'Python 3 was not found. Install it with: winget install -e --id Python.Python.3.12'
+        throw 'A 64-bit Python >= 3.10 was not found. Install Python 3.12 with: winget install -e --id Python.Python.3.12'
     }
     Install-WingetPackage 'Python.Python.3.12'
     $env:Path += ";$env:LOCALAPPDATA\Programs\Python\Launcher;$env:LOCALAPPDATA\Programs\Python\Python312"
     $python = Resolve-Python
     if (-not $python) {
-        throw 'Python was installed but is not visible yet. Close PowerShell, reopen it, then run setup.ps1 again.'
+        throw 'Python 3.12 was installed but a compatible 64-bit interpreter is not visible yet. Close PowerShell, reopen it, then run setup.ps1 again.'
     }
 }
 
@@ -76,12 +113,21 @@ if (-not $curl) {
 
 $venv = Join-Path $Root '.venv'
 $venvPython = Join-Path $venv 'Scripts\python.exe'
-if (-not (Test-Path $venvPython)) {
+if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
+    if (-not (Test-PythonCandidate -Exe $venvPython)) {
+        Write-Warning 'Existing .venv uses an unsupported Python build; recreating it with a compatible 64-bit Python.'
+        Remove-Item -LiteralPath $venv -Recurse -Force
+    }
+}
+if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
     $pyArgs = @()
     $pyArgs += $python.Prefix
     $pyArgs += @('-m', 'venv', $venv)
     & $python.Exe @pyArgs
     if ($LASTEXITCODE -ne 0) { throw "Python venv creation failed rc=$LASTEXITCODE" }
+}
+if (-not (Test-PythonCandidate -Exe $venvPython)) {
+    throw 'The runtime virtual environment is not 64-bit Python >= 3.10.'
 }
 
 & $venvPython -m pip install --upgrade pip
@@ -100,9 +146,9 @@ Write-Host 'Running native Windows DLL/direct-I/O sanity...'
 & $venvPython -u (Join-Path $Root 'runtime\win32_generate.py') sanity --build-dir (Join-Path $Root 'build\win32')
 if ($LASTEXITCODE -ne 0) { throw "native Windows sanity failed rc=$LASTEXITCODE" }
 
-Write-Host 'Downloading the pinned GGUF with low-RAM resumable curl...'
+Write-Host 'Downloading the pinned GGUF and tokenizer with low-RAM resumable curl...'
 & (Join-Path $Root 'scripts\download_model.ps1')
-if ($LASTEXITCODE -ne 0) { throw "model download failed rc=$LASTEXITCODE" }
+if ($LASTEXITCODE -ne 0) { throw "model/tokenizer download failed rc=$LASTEXITCODE" }
 
 $work = Join-Path $Root 'work'
 $k3 = Join-Path $work 'k3'

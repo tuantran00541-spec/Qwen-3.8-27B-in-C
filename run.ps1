@@ -7,9 +7,26 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
-if (-not (Test-Path $Python)) {
-    throw 'Runtime is not set up yet. Run .\setup.ps1 first.'
+
+if ($MaxNewTokens -lt 1) {
+    throw 'MaxNewTokens must be at least 1.'
 }
+
+$RequiredFiles = @(
+    $Python,
+    (Join-Path $Root 'models\Qwen3.8-27B-Q6_K_L.gguf'),
+    (Join-Path $Root 'models\qwen-official\tokenizer.json'),
+    (Join-Path $Root 'work\inventory.json'),
+    (Join-Path $Root 'build\win32\qwen_glibc_expf_compat.dll'),
+    (Join-Path $Root 'build\win32\qwen_quant_base.dll'),
+    (Join-Path $Root 'build\win32\qwen_gdn_state.dll'),
+    (Join-Path $Root 'build\win32\qwen_win32_direct_io.dll')
+)
+$Missing = @($RequiredFiles | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+if ($Missing.Count -gt 0) {
+    throw "Runtime setup is incomplete. Missing required files:`n  - $($Missing -join "`n  - ")`nRerun: powershell -ExecutionPolicy Bypass -File .\setup.ps1"
+}
+
 if ([string]::IsNullOrWhiteSpace($Prompt)) {
     $Prompt = Read-Host 'You'
 }
