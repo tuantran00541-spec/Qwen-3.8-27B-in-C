@@ -109,6 +109,16 @@ _WANTED_DEFAULT = frozenset({
     "qwen35.block_count",
     "qwen35.embedding_length",
     "qwen35.full_attention_interval",
+    "prism.hadamard.version",
+    "prism.hadamard.block_size",
+    "prism.hadamard.transform",
+    "prism.hadamard.axis",
+    "prism.hadamard.sign_mode",
+    "prism.hadamard.weight_names",
+    "prism.hadamard.sign_widths",
+    "prism.hadamard.sign_values",
+    "prism.hadamard.gdn_v_grouped",
+    "prism.hadamard.inverse_weight_names",
 })
 _MAX_STRING_BYTES = 1 << 30
 _MAX_CONTAINER_ITEMS = 10_000_000
