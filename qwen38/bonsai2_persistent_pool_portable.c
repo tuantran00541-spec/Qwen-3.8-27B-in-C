@@ -273,3 +273,66 @@ QWEN_EXPORT uint64_t qwen_bonsai2_pool_calls(void *opaque) {
     const qwen_bonsai2_pool *p = (const qwen_bonsai2_pool *)opaque;
     return p ? p->calls : 0;
 }
+
+
+#ifdef QWEN_BONSAI2_PORTABLE_POOL_SELFTEST
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    enum { N = 128, ROWS = 257 };
+    uint8_t *weights = (uint8_t *)calloc((size_t)ROWS, QWEN_BLOCK_PTQ1_0);
+    uint8_t activation[4 * QWEN_BLOCK_Q8_0] = {0};
+    float *reference = (float *)calloc((size_t)ROWS, sizeof(float));
+    float *candidate = (float *)calloc((size_t)ROWS, sizeof(float));
+    if (!weights || !reference || !candidate) return 20;
+
+    for (int r = 0; r < ROWS; ++r) {
+        uint8_t *block = weights + (size_t)r * QWEN_BLOCK_PTQ1_0;
+        block[26] = 0x00;
+        block[27] = 0x3c; /* fp16 1.0; zero trits decode to -1 */
+    }
+    for (int k = 0; k < 4; ++k) {
+        uint8_t *block = activation + k * QWEN_BLOCK_Q8_0;
+        block[0] = 0x00;
+        block[1] = 0x3c; /* fp16 1.0 */
+        memset(block + 2, 1, 32);
+    }
+
+    if (qwen_bonsai2_matvec_ptq1_0_q8_0(
+            weights, (size_t)ROWS * QWEN_BLOCK_PTQ1_0,
+            ROWS, N, activation, sizeof(activation), reference) != 0) return 21;
+
+    const int threads_to_test[] = {1, 2, 4};
+    for (int it = 0; it < 3; ++it) {
+        const int nth = threads_to_test[it];
+        void *pool = qwen_bonsai2_pool_create(nth, ROWS);
+        if (!pool) return 30 + it;
+        memset(candidate, 0, (size_t)ROWS * sizeof(float));
+        const int rc = qwen_bonsai2_pool_matvec_ptq1_0(
+            pool,
+            weights, (size_t)ROWS * QWEN_BLOCK_PTQ1_0,
+            ROWS, N, activation, sizeof(activation), candidate);
+        if (rc != 0) {
+            qwen_bonsai2_pool_destroy(pool);
+            return 40 + it;
+        }
+        if (memcmp(reference, candidate, (size_t)ROWS * sizeof(float)) != 0) {
+            qwen_bonsai2_pool_destroy(pool);
+            return 50 + it;
+        }
+        if (qwen_bonsai2_pool_threads(pool) != nth ||
+            qwen_bonsai2_pool_calls(pool) != 1) {
+            qwen_bonsai2_pool_destroy(pool);
+            return 60 + it;
+        }
+        qwen_bonsai2_pool_destroy(pool);
+    }
+
+    free(weights);
+    free(reference);
+    free(candidate);
+    puts("QWEN38_BONSAI2_PORTABLE_POOL_PASS");
+    return 0;
+}
+#endif
