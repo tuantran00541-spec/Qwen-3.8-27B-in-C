@@ -1,0 +1,31 @@
+name: Bonsai 2 fused PTQ1 gate
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/test_bonsai2_ptq1_fused.c
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - .github/workflows/bonsai2-ptq1-fused.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fused-ptq1:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile fused PTQ1 bitwise gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gcc -O3 -std=c11 -mavx2 -mfma \
+            -Werror=implicit-function-declaration \
+            qwen38/test_bonsai2_ptq1_fused.c -lm \
+            -o bonsai2-ptq1-fused-gate
+      - name: Run fused PTQ1 bitwise gate
+        shell: bash
+        run: ./bonsai2-ptq1-fused-gate
