@@ -72,11 +72,17 @@ class GDNStateRuntime:
         self.pool = self.lib.qwen_gdn_pool_create(int(threads))
         if not self.pool:
             raise RuntimeError(f"failed to create GDN state pool threads={threads}")
+        self.timing_seconds = {"step": 0.0}
+        self.timing_calls = {"step": 0}
 
     def step(self, state, q, k, v, gate, beta, out) -> int:
-        return int(self.lib.qwen_gdn_pool_step_f32(
+        started = time.perf_counter()
+        rc = int(self.lib.qwen_gdn_pool_step_f32(
             self.pool, state, q, k, v, gate, beta, out
         ))
+        self.timing_seconds["step"] += time.perf_counter() - started
+        self.timing_calls["step"] += 1
+        return rc
 
     def report(self) -> dict[str, int | bool]:
         if not self.pool:
@@ -85,6 +91,8 @@ class GDNStateRuntime:
             "persistent_pool": True,
             "threads": int(self.lib.qwen_gdn_pool_threads(self.pool)),
             "calls": int(self.lib.qwen_gdn_pool_calls(self.pool)),
+            "timing_seconds": dict(self.timing_seconds),
+            "timing_calls": dict(self.timing_calls),
         }
 
     def close(self) -> None:
