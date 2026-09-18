@@ -35,6 +35,61 @@ N_LAYER = 64
 EOS_IDS = {248044, 248046}
 
 
+class Bonsai2DecoderReader(K3Trunk):
+    def __init__(
+        self,
+        bin_path: Path,
+        index_path: Path,
+        manifest: dict[str, Any],
+        *,
+        resident_decoder: bool,
+        prefer_direct_io: bool = True,
+    ) -> None:
+        layers = list(manifest["layers"])
+        if not layers:
+            raise ValueError("decoder manifest has no layers")
+        self.resident_decoder = bool(resident_decoder)
+        self.decoder_resident_bytes = sum(int(x["read_bytes"]) for x in layers)
+        max_layer_bytes = max(int(x["read_bytes"]) for x in layers)
+        if self.resident_decoder:
+            budget_bytes = self.decoder_resident_bytes
+            max_pinned = len(layers)
+        else:
+            budget_bytes = 2 * max_layer_bytes
+            max_pinned = 0
+        super().__init__(
+            bin_path,
+            index_path,
+            budget_bytes=budget_bytes,
+            want_ring=2,
+            max_pinned=max_pinned,
+            prefer_direct_io=prefer_direct_io,
+        )
+
+    def report(self) -> dict[str, Any]:
+        out = super().report()
+        out["resident_decoder"] = self.resident_decoder
+        out["decoder_resident_bytes"] = self.decoder_resident_bytes
+        return out
+
+
+def make_decoder_reader(
+    bin_path: Path,
+    index_path: Path,
+    manifest: dict[str, Any],
+    *,
+    resident_decoder: bool,
+    prefer_direct_io: bool = True,
+) -> Bonsai2DecoderReader:
+    return Bonsai2DecoderReader(
+        bin_path,
+        index_path,
+        manifest,
+        resident_decoder=resident_decoder,
+        prefer_direct_io=prefer_direct_io,
+    )
+
+
 def f32(x: float) -> float:
     return exact.f32(x)
 
@@ -234,6 +289,7 @@ class StatefulBonsai2Generator:
         state_lib_path: Path,
         work_dir: Path,
         threads: int,
+        resident_decoder: bool = False,
     ) -> None:
         exact.install()
         self.model = model
@@ -278,15 +334,11 @@ class StatefulBonsai2Generator:
             source_sha256=base.MODEL_SHA256,
             expected_layers=N_LAYER,
         )
-        max_layer_bytes = max(
-            int(layer["read_bytes"]) for layer in self.manifest["layers"]
-        )
-        self.reader = K3Trunk(
+        self.reader = make_decoder_reader(
             trunk,
             manifest_path,
-            budget_bytes=2 * max_layer_bytes,
-            want_ring=2,
-            max_pinned=0,
+            self.manifest,
+            resident_decoder=resident_decoder,
             prefer_direct_io=True,
         )
         self.output_norm = base.read_f32_global(
@@ -390,6 +442,7 @@ def run(
     work_dir: Path,
     output: Path,
     threads: int,
+    resident_decoder: bool = False,
 ) -> dict[str, Any]:
     started = time.monotonic()
     tokenizer = textgen.load_tokenizer(tokenizer_json)
@@ -400,7 +453,12 @@ def run(
         raise ValueError("max_new_tokens must be positive")
 
     engine = StatefulBonsai2Generator(
-        model, native_lib, state_lib, work_dir, threads
+        model,
+        native_lib,
+        state_lib,
+        work_dir,
+        threads,
+        resident_decoder=resident_decoder,
     )
     generated: list[int] = []
     token_reports: list[dict[str, Any]] = []
@@ -479,6 +537,7 @@ def run(
                 else "max_new_tokens"
             ),
             "threads": threads,
+            "resident_decoder": resident_decoder,
             "timing": {
                 "prefill_total_seconds": sum(prefill_seconds),
                 "prefill_mean_seconds_per_token": (
@@ -524,6 +583,7 @@ def main() -> None:
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--max-new-tokens", type=int, default=12)
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--resident-decoder", action="store_true")
     ap.add_argument("--work-dir", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
     args = ap.parse_args()
@@ -537,6 +597,7 @@ def main() -> None:
         args.work_dir,
         args.output,
         args.threads,
+        args.resident_decoder,
     )
 
 
