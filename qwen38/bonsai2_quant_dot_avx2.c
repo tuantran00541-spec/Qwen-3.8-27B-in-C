@@ -25,6 +25,30 @@
 #define QWEN_QK_PTQ1_0 128
 #define QWEN_BLOCK_PTQ1_0 28
 
+#ifndef QWEN_EXPORT
+#ifdef _WIN32
+#define QWEN_EXPORT __declspec(dllexport)
+#elif defined(__GNUC__) || defined(__clang__)
+#define QWEN_EXPORT __attribute__((visibility("default")))
+#else
+#define QWEN_EXPORT
+#endif
+#endif
+
+QWEN_EXPORT int qwen_bonsai2_swiglu_f32(
+        const float *gate, const float *up, size_t n, float *out) {
+    if (!gate || !up || !out || n == 0) return -1;
+    for (size_t i = 0; i < n; ++i) {
+        const float x = gate[i];
+        const float e = expf(-x);
+        const float denom = 1.0f + e;
+        const float sigmoid = 1.0f / denom;
+        const float silu = x * sigmoid;
+        out[i] = silu * up[i];
+    }
+    return 0;
+}
+
 static inline int32_t qwen_bonsai2_dot_i8_32_avx2(
         const int8_t *a, const int8_t *b) {
     const __m128i a0 = _mm_loadu_si128((const __m128i *)(a + 0));
