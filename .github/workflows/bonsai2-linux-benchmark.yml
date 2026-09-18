@@ -1,0 +1,119 @@
+name: Bonsai 2 Linux full benchmark
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - .github/workflows/bonsai2-linux-benchmark.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-cpu-reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner hardware
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/bonsai2-linux
+          {
+            echo "=== uname ==="
+            uname -a
+            echo
+            echo "=== lscpu ==="
+            lscpu
+            echo
+            echo "=== memory ==="
+            free -h
+            echo
+            echo "=== disks ==="
+            df -h
+            echo
+            echo "=== nproc ==="
+            nproc
+          } | tee work/bonsai2-linux/hardware.txt
+
+      - name: Download pinned Prism llama.cpp CPU runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          RELEASE="prism-b10683-d8f26ee"
+          ASSET="llama-${RELEASE}-bin-ubuntu-x64.tar.gz"
+          URL="https://github.com/PrismML-Eng/llama.cpp/releases/download/${RELEASE}/${ASSET}"
+          mkdir -p tools/prism-llama
+          curl -fL --retry 5 --retry-all-errors -o /tmp/prism-llama.tar.gz "$URL"
+          tar -xzf /tmp/prism-llama.tar.gz -C tools/prism-llama
+          find tools/prism-llama -maxdepth 3 -type f -name 'llama-bench' -print
+          BENCH="$(find tools/prism-llama -type f -name 'llama-bench' | head -n1)"
+          test -n "$BENCH"
+          chmod +x "$BENCH"
+          echo "BENCH=$BENCH" >> "$GITHUB_ENV"
+          "$BENCH" --version 2>&1 | tee work/bonsai2-linux/llama-version.txt || true
+
+      - name: Run PTQ1_0 full CPU sweep
+        shell: bash
+        run: |
+          set -euxo pipefail
+          MODEL="models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+          URL="https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/6ed5e12bf84b7a63069882c91dd9e9218647d17b/Ternary-Bonsai-2-27B-PTQ1_0.gguf?download=true"
+          SHA="53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"
+          mkdir -p "$(dirname "$MODEL")"
+          curl -fL --retry 10 --retry-all-errors -C - -o "$MODEL.part" "$URL"
+          echo "$SHA  $MODEL.part" | sha256sum -c -
+          mv "$MODEL.part" "$MODEL"
+
+          NPROC="$(nproc)"
+          THREADS="$(printf '%s\n' 1 2 "$NPROC" | awk '$1>0' | sort -nu | tr '\n' ' ')"
+          echo "PTQ1_0 thread sweep: $THREADS" | tee work/bonsai2-linux/ptq1-summary.txt
+
+          /usr/bin/time -v "$BENCH" -m "$MODEL" -ngl 0 -fa 1 -t "$NPROC" -p 16 -n 4 -r 1             > work/bonsai2-linux/ptq1-warmup.stdout.txt             2> work/bonsai2-linux/ptq1-warmup.stderr.txt
+
+          for T in $THREADS; do
+            echo "=== PTQ1_0 threads=$T ===" | tee -a work/bonsai2-linux/ptq1-summary.txt
+            /usr/bin/time -v "$BENCH" -m "$MODEL" -ngl 0 -fa 1 -t "$T" -p 512 -n 128 -r 2               > "work/bonsai2-linux/ptq1-t${T}.stdout.txt"               2> "work/bonsai2-linux/ptq1-t${T}.stderr.txt"
+            cat "work/bonsai2-linux/ptq1-t${T}.stdout.txt" | tee -a work/bonsai2-linux/ptq1-summary.txt
+            grep -E 'Maximum resident set size|Elapsed \(wall clock\) time|User time|System time'               "work/bonsai2-linux/ptq1-t${T}.stderr.txt" | tee -a work/bonsai2-linux/ptq1-summary.txt || true
+          done
+
+          rm -f "$MODEL"
+
+      - name: Run PQ2_0 full CPU sweep
+        shell: bash
+        run: |
+          set -euxo pipefail
+          MODEL="models/bonsai2/Ternary-Bonsai-2-27B-PQ2_0.gguf"
+          URL="https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/6ed5e12bf84b7a63069882c91dd9e9218647d17b/Ternary-Bonsai-2-27B-PQ2_0.gguf?download=true"
+          SHA="3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1"
+          mkdir -p "$(dirname "$MODEL")"
+          curl -fL --retry 10 --retry-all-errors -C - -o "$MODEL.part" "$URL"
+          echo "$SHA  $MODEL.part" | sha256sum -c -
+          mv "$MODEL.part" "$MODEL"
+
+          NPROC="$(nproc)"
+          THREADS="$(printf '%s\n' 1 2 "$NPROC" | awk '$1>0' | sort -nu | tr '\n' ' ')"
+          echo "PQ2_0 thread sweep: $THREADS" | tee work/bonsai2-linux/pq2-summary.txt
+
+          /usr/bin/time -v "$BENCH" -m "$MODEL" -ngl 0 -fa 1 -t "$NPROC" -p 16 -n 4 -r 1             > work/bonsai2-linux/pq2-warmup.stdout.txt             2> work/bonsai2-linux/pq2-warmup.stderr.txt
+
+          for T in $THREADS; do
+            echo "=== PQ2_0 threads=$T ===" | tee -a work/bonsai2-linux/pq2-summary.txt
+            /usr/bin/time -v "$BENCH" -m "$MODEL" -ngl 0 -fa 1 -t "$T" -p 512 -n 128 -r 2               > "work/bonsai2-linux/pq2-t${T}.stdout.txt"               2> "work/bonsai2-linux/pq2-t${T}.stderr.txt"
+            cat "work/bonsai2-linux/pq2-t${T}.stdout.txt" | tee -a work/bonsai2-linux/pq2-summary.txt
+            grep -E 'Maximum resident set size|Elapsed \(wall clock\) time|User time|System time'               "work/bonsai2-linux/pq2-t${T}.stderr.txt" | tee -a work/bonsai2-linux/pq2-summary.txt || true
+          done
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai2-linux-full-benchmark
+          path: work/bonsai2-linux/
+          if-no-files-found: error
+          retention-days: 30
