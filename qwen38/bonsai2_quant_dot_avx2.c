@@ -122,33 +122,71 @@ static inline float qwen_bonsai2_bf16_to_f32(uint16_t v) {
     return out;
 }
 
+static inline uint16_t qwen_bonsai2_f32_to_bf16_rne(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7fffffffu) > 0x7f800000u) {
+        return (uint16_t)((bits >> 16) | 64u);
+    }
+    return (uint16_t)((bits + (0x7fffu + ((bits >> 16) & 1u))) >> 16);
+}
+
+static inline float qwen_bonsai2_vec_dot_bf16_avx2(
+        const uint16_t *x, const uint16_t *y, size_t n) {
+    size_t i = 0;
+    __m256 c1 = _mm256_setzero_ps();
+    __m256 c2 = _mm256_setzero_ps();
+    __m256 c3 = _mm256_setzero_ps();
+    __m256 c4 = _mm256_setzero_ps();
+
+#define QWEN_BF16_LOAD8(p) _mm256_castsi256_ps(     _mm256_slli_epi32(         _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(p))), 16))
+
+    for (; i + 32 <= n; i += 32) {
+        c1 = _mm256_add_ps(
+            _mm256_mul_ps(QWEN_BF16_LOAD8(x + i), QWEN_BF16_LOAD8(y + i)), c1);
+        c2 = _mm256_add_ps(
+            _mm256_mul_ps(QWEN_BF16_LOAD8(x + i + 8), QWEN_BF16_LOAD8(y + i + 8)), c2);
+        c3 = _mm256_add_ps(
+            _mm256_mul_ps(QWEN_BF16_LOAD8(x + i + 16), QWEN_BF16_LOAD8(y + i + 16)), c3);
+        c4 = _mm256_add_ps(
+            _mm256_mul_ps(QWEN_BF16_LOAD8(x + i + 24), QWEN_BF16_LOAD8(y + i + 24)), c4);
+    }
+
+    c1 = _mm256_add_ps(_mm256_add_ps(c1, c3), _mm256_add_ps(c2, c4));
+    __m128 g = _mm_add_ps(
+        _mm256_extractf128_ps(c1, 1), _mm256_castps256_ps128(c1));
+    g = _mm_add_ps(g, _mm_movehl_ps(g, g));
+    g = _mm_add_ss(g, _mm_movehdup_ps(g));
+    float sum = _mm_cvtss_f32(g);
+
+#undef QWEN_BF16_LOAD8
+
+    for (; i < n; ++i) {
+        sum += qwen_bonsai2_bf16_to_f32(x[i]) * qwen_bonsai2_bf16_to_f32(y[i]);
+    }
+    return sum;
+}
+
 int qwen_bonsai2_matvec_bf16_f32(
         const uint8_t *weights, size_t weights_bytes, size_t rows, size_t n,
         const float *activation, float *out) {
     if (!weights || !activation || !out || rows == 0 || n == 0) return -1;
     if (weights_bytes != rows * n * 2) return -2;
-    for (size_t r = 0; r < rows; ++r) {
-        const uint8_t *row = weights + r * n * 2;
-        __m256 acc = _mm256_setzero_ps();
-        size_t i = 0;
-        for (; i + 8 <= n; i += 8) {
-            const __m128i b16 = _mm_loadu_si128((const __m128i *)(row + i * 2));
-            __m256i u32 = _mm256_cvtepu16_epi32(b16);
-            u32 = _mm256_slli_epi32(u32, 16);
-            const __m256 w = _mm256_castsi256_ps(u32);
-            const __m256 x = _mm256_loadu_ps(activation + i);
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(w, x));
-        }
-        float lanes[8];
-        _mm256_storeu_ps(lanes, acc);
-        float sum = 0.0f;
-        for (int k = 0; k < 8; ++k) sum += lanes[k];
-        for (; i < n; ++i) {
-            const uint16_t raw = qwen_load_u16_le(row + i * 2);
-            sum += qwen_bonsai2_bf16_to_f32(raw) * activation[i];
-        }
-        out[r] = sum;
+
+    /* GGML BF16 matmul does not dot BF16 weights directly with F32 src1.
+     * Its type trait converts src1 F32 -> BF16 using round-to-nearest-even,
+     * then ggml_vec_dot_bf16 consumes BF16 x BF16. Mirror that contract. */
+    uint16_t *act_bf16 = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!act_bf16) return -3;
+    for (size_t i = 0; i < n; ++i) {
+        act_bf16[i] = qwen_bonsai2_f32_to_bf16_rne(activation[i]);
     }
+
+    for (size_t r = 0; r < rows; ++r) {
+        const uint16_t *row = (const uint16_t *)(weights + r * n * 2);
+        out[r] = qwen_bonsai2_vec_dot_bf16_avx2(row, act_bf16, n);
+    }
+    free(act_bf16);
     return 0;
 }
 
