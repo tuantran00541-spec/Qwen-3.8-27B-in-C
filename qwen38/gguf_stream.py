@@ -56,6 +56,8 @@ GGML_TYPE_I32 = 26
 GGML_TYPE_I64 = 27
 GGML_TYPE_F64 = 28
 GGML_TYPE_BF16 = 30
+GGML_TYPE_PQ2_0 = 142  # PrismML group-128 ternary-compatible 2-bit packing
+GGML_TYPE_PTQ1_0 = 143  # PrismML group-128 packed ternary trits
 
 # (name, quant block elements, encoded bytes). Values mirror
 # gguf-py/gguf/constants.py::GGML_QUANT_SIZES at the pinned llama.cpp commit.
@@ -80,6 +82,12 @@ GGML_TYPE_INFO: dict[int, tuple[str, int, int]] = {
     GGML_TYPE_I64: ("I64", 1, 8),
     GGML_TYPE_F64: ("F64", 1, 8),
     GGML_TYPE_BF16: ("BF16", 1, 2),
+    # PrismML Bonsai 2. These ids/layouts are pinned to the Prism fork used by
+    # Bonsai-demo (prism-b10683-d8f26ee): both use 128-weight groups.
+    # PQ2_0 = fp16 scale + 32 packed 2-bit bytes = 34 bytes/block.
+    # PTQ1_0 = 24 base-3 bytes + 2 high-trit bytes + fp16 scale = 28 bytes/block.
+    GGML_TYPE_PQ2_0: ("PQ2_0", 128, 34),
+    GGML_TYPE_PTQ1_0: ("PTQ1_0", 128, 28),
 }
 
 # Exact encoded block layouts used by llama.cpp for the primary gold path.
