@@ -7,6 +7,7 @@ on:
     paths:
       - qwen38/bonsai2_quant_dot_avx2.c
       - qwen38/bonsai2_quant_runtime.py
+      - qwen38/bonsai2_persistent_pool.c
       - qwen38/bonsai2_k3_stream_probe.py
       - qwen38/gguf_stream.py
       - qwen38/gguf_k3_layout.py
@@ -43,15 +44,15 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          gcc -O3 -std=c11 -mavx2 -mfma             -DQWEN_BONSAI2_QUANT_SELFTEST             qwen38/bonsai2_quant_dot_avx2.c             -lm -o work/bonsai2-native/bonsai2-selftest
-          ./work/bonsai2-native/bonsai2-selftest             | tee work/bonsai2-native/native-selftest.txt
+          gcc -O3 -std=c11 -mavx2 -mfma -DQWEN_BONSAI2_QUANT_SELFTEST qwen38/bonsai2_quant_dot_avx2.c -lm -o work/bonsai2-native/bonsai2-selftest
+          ./work/bonsai2-native/bonsai2-selftest | tee work/bonsai2-native/native-selftest.txt
 
-      - name: Build native Bonsai 2 shared library
+      - name: Build native Bonsai 2 persistent-pool library
         shell: bash
         run: |
           set -euxo pipefail
-          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared             qwen38/bonsai2_quant_dot_avx2.c             -lm -o work/bonsai2-native/libbonsai2_quant.so
-          python -m py_compile             qwen38/bonsai2_quant_runtime.py             qwen38/bonsai2_k3_stream_probe.py             qwen38/gguf_stream.py             qwen38/gguf_k3_layout.py             qwen38/k3_stream.py
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared qwen38/bonsai2_persistent_pool.c -pthread -lm -o work/bonsai2-native/libbonsai2_quant.so
+          python -m py_compile qwen38/bonsai2_quant_runtime.py qwen38/bonsai2_k3_stream_probe.py qwen38/gguf_stream.py qwen38/gguf_k3_layout.py qwen38/k3_stream.py
 
       - name: Download verified PTQ1_0 GGUF
         shell: bash
@@ -65,21 +66,25 @@ jobs:
           echo "$SHA  $MODEL.part" | sha256sum -c -
           mv "$MODEL.part" "$MODEL"
 
-      - name: Run real K3 streamed native C matvec
+      - name: Run single-thread and full-runner K3 matvec
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p work/bonsai2-native/k3
-          /usr/bin/time -v python qwen38/bonsai2_k3_stream_probe.py             --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf             --native-lib work/bonsai2-native/libbonsai2_quant.so             --work-dir work/bonsai2-native/k3             --source-sha256 53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3             --output work/bonsai2-native/native-k3-result.json             > work/bonsai2-native/native-k3.stdout.txt             2> work/bonsai2-native/native-k3.stderr.txt
-          cat work/bonsai2-native/native-k3.stdout.txt
-          cat work/bonsai2-native/native-k3.stderr.txt
+          NPROC="$(nproc)"
+          for T in 1 "$NPROC"; do
+            DIR="work/bonsai2-native/k3-t${T}"
+            mkdir -p "$DIR"
+            /usr/bin/time -v python qwen38/bonsai2_k3_stream_probe.py --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf --native-lib work/bonsai2-native/libbonsai2_quant.so --work-dir "$DIR" --source-sha256 53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3 --threads "$T" --output "work/bonsai2-native/native-k3-t${T}-result.json" > "work/bonsai2-native/native-k3-t${T}.stdout.txt" 2> "work/bonsai2-native/native-k3-t${T}.stderr.txt"
+            cat "work/bonsai2-native/native-k3-t${T}.stdout.txt"
+            cat "work/bonsai2-native/native-k3-t${T}.stderr.txt"
+          done
 
       - name: Drop model before artifact upload
         if: always()
         shell: bash
         run: |
           rm -rf models/bonsai2
-          rm -f work/bonsai2-native/k3/layer0.k3.bin
+          find work/bonsai2-native -name 'layer0.k3.bin' -delete
 
       - name: Upload native stream evidence
         if: always()
@@ -89,6 +94,6 @@ jobs:
           path: |
             work/bonsai2-native/*.json
             work/bonsai2-native/*.txt
-            work/bonsai2-native/k3/*.json
+            work/bonsai2-native/k3-t*/*.json
           if-no-files-found: warn
           retention-days: 30
