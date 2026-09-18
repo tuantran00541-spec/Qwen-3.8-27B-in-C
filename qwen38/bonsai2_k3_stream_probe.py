@@ -131,6 +131,7 @@ def main() -> None:
     ap.add_argument("--native-lib", type=Path, required=True)
     ap.add_argument("--work-dir", type=Path, required=True)
     ap.add_argument("--source-sha256", required=True)
+    ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--output", type=Path, required=True)
     args = ap.parse_args()
 
@@ -138,7 +139,9 @@ def main() -> None:
     directory = parse_gguf(args.model)
     grouped, _, _ = partition_tensors(directory, expected_layers=64)
 
-    runtime = Bonsai2NativeRuntime(args.native_lib, directory.metadata)
+    runtime = Bonsai2NativeRuntime(
+        args.native_lib, directory.metadata, threads=args.threads
+    )
     tensor = pick_tensor(grouped[0], set(runtime.folded_weights))
     ne0, rows = map(int, tensor.shape)
 
@@ -250,6 +253,7 @@ def main() -> None:
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    runtime.close()
     print(json.dumps(state, indent=2, sort_keys=True))
     print("QWEN38_BONSAI2_NATIVE_K3_STREAM_PASS")
 
