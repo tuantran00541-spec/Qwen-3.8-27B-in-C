@@ -142,7 +142,7 @@ def ffn(runtime, view, metas, prefix: str, x: Sequence[float]) -> list[float]:
     up = runtime.matvec_prepared(
         view("ffn_up.weight"), metas[f"{prefix}.ffn_up.weight"], prepared
     )
-    sw = [mulf(siluf(gate[i]), up[i]) for i in range(gdn.INTERMEDIATE)]
+    sw = runtime.swiglu(gate, up)
     return runtime.matvec(view("ffn_down.weight"), metas[f"{prefix}.ffn_down.weight"], sw)
 
 
