@@ -82,6 +82,97 @@ static void qwen_bonsai2_decode_pq2_block(
     }
 }
 
+
+int qwen_bonsai2_dequantize_ptq1_0_row(
+        const uint8_t *weights, size_t weights_bytes, size_t n, float *out) {
+    if (!weights || !out || n == 0 || n % QWEN_QK_PTQ1_0 != 0) return -1;
+    const size_t nb = n / QWEN_QK_PTQ1_0;
+    if (weights_bytes != nb * QWEN_BLOCK_PTQ1_0) return -2;
+    int8_t lut[256][5];
+    int8_t q[128];
+    qwen_bonsai2_ptq1_lut(lut);
+    for (size_t ib = 0; ib < nb; ++ib) {
+        const uint8_t *xb = weights + ib * QWEN_BLOCK_PTQ1_0;
+        qwen_bonsai2_decode_ptq1_block(xb, lut, q);
+        const float d = qwen_f16_to_f32(qwen_load_u16_le(xb + 26));
+        for (int j = 0; j < 128; ++j) out[ib * 128 + (size_t)j] = d * (float)q[j];
+    }
+    return 0;
+}
+
+int qwen_bonsai2_dequantize_pq2_0_row(
+        const uint8_t *weights, size_t weights_bytes, size_t n, float *out) {
+    if (!weights || !out || n == 0 || n % QWEN_QK_PQ2_0 != 0) return -1;
+    const size_t nb = n / QWEN_QK_PQ2_0;
+    if (weights_bytes != nb * QWEN_BLOCK_PQ2_0) return -2;
+    int8_t q[128];
+    for (size_t ib = 0; ib < nb; ++ib) {
+        const uint8_t *xb = weights + ib * QWEN_BLOCK_PQ2_0;
+        qwen_bonsai2_decode_pq2_block(xb, q);
+        const float d = qwen_f16_to_f32(qwen_load_u16_le(xb));
+        for (int j = 0; j < 128; ++j) out[ib * 128 + (size_t)j] = d * (float)q[j];
+    }
+    return 0;
+}
+
+static inline float qwen_bonsai2_bf16_to_f32(uint16_t v) {
+    uint32_t bits = ((uint32_t)v) << 16;
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+int qwen_bonsai2_matvec_bf16_f32(
+        const uint8_t *weights, size_t weights_bytes, size_t rows, size_t n,
+        const float *activation, float *out) {
+    if (!weights || !activation || !out || rows == 0 || n == 0) return -1;
+    if (weights_bytes != rows * n * 2) return -2;
+    for (size_t r = 0; r < rows; ++r) {
+        const uint8_t *row = weights + r * n * 2;
+        __m256 acc = _mm256_setzero_ps();
+        size_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            const __m128i b16 = _mm_loadu_si128((const __m128i *)(row + i * 2));
+            __m256i u32 = _mm256_cvtepu16_epi32(b16);
+            u32 = _mm256_slli_epi32(u32, 16);
+            const __m256 w = _mm256_castsi256_ps(u32);
+            const __m256 x = _mm256_loadu_ps(activation + i);
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(w, x));
+        }
+        float lanes[8];
+        _mm256_storeu_ps(lanes, acc);
+        float sum = 0.0f;
+        for (int k = 0; k < 8; ++k) sum += lanes[k];
+        for (; i < n; ++i) {
+            const uint16_t raw = qwen_load_u16_le(row + i * 2);
+            sum += qwen_bonsai2_bf16_to_f32(raw) * activation[i];
+        }
+        out[r] = sum;
+    }
+    return 0;
+}
+
+/* Qwen3.5 GDN ssm_out receives 48 V heads in tiled order where
+ * old_head = k_group + 16 * repeat. Prism folds ssm_out after regrouping to
+ * grouped order new_head = repeat + 3 * k_group. Each head has 128 values. */
+int qwen_bonsai2_permute_gdn_ssm_out_f32(
+        const float *src, float *dst, size_t n,
+        size_t head_dim, size_t n_k, size_t repeat) {
+    if (!src || !dst || head_dim == 0 || n_k == 0 || repeat == 0) return -1;
+    if (n != head_dim * n_k * repeat) return -2;
+    for (size_t k = 0; k < n_k; ++k) {
+        for (size_t rep = 0; rep < repeat; ++rep) {
+            const size_t old_head = k + n_k * rep;
+            const size_t new_head = rep + repeat * k;
+            memcpy(
+                dst + new_head * head_dim,
+                src + old_head * head_dim,
+                head_dim * sizeof(float));
+        }
+    }
+    return 0;
+}
+
 static float qwen_bonsai2_vec_dot_pq2_q8_0(
         const uint8_t *weights, const uint8_t *activation, size_t n) {
     const size_t nb = n / QWEN_QK_PQ2_0;
@@ -199,6 +290,35 @@ int qwen_bonsai2_fwht_blocks(
     return 0;
 }
 
+
+int qwen_bonsai2_inverse_fwht_blocks(
+        float *x, size_t n, size_t block_size, const int8_t *signs) {
+    if (!x || n == 0 || block_size == 0 ||
+        (block_size & (block_size - 1)) != 0 || n % block_size != 0) {
+        return -1;
+    }
+    const float scale = 1.0f / sqrtf((float)block_size);
+    for (size_t base = 0; base < n; base += block_size) {
+        for (size_t j = 0; j < block_size; ++j) x[base + j] *= scale;
+        for (size_t len = 1; len < block_size; len <<= 1) {
+            for (size_t i = 0; i < block_size; i += 2 * len) {
+                for (size_t j = 0; j < len; ++j) {
+                    const float u = x[base + i + j];
+                    const float v = x[base + i + len + j];
+                    x[base + i + j] = u + v;
+                    x[base + i + len + j] = u - v;
+                }
+            }
+        }
+        if (signs) {
+            for (size_t j = 0; j < block_size; ++j) {
+                x[base + j] *= (float)signs[base + j];
+            }
+        }
+    }
+    return 0;
+}
+
 #ifdef QWEN_BONSAI2_QUANT_SELFTEST
 static int qwen_bonsai2_close(float a, float b, float tol) {
     return fabsf(a - b) <= tol * fmaxf(1.0f, fmaxf(fabsf(a), fabsf(b)));
@@ -249,6 +369,21 @@ int main(void) {
                     i, hs[i], expected_s[i]);
             return 8;
         }
+    }
+
+    float inv[4] = {5.0f, -1.0f, -2.0f, 0.0f};
+    if (qwen_bonsai2_inverse_fwht_blocks(inv, 4, 4, NULL) != 0) return 9;
+    const float primal[4] = {1, 2, 3, 4};
+    for (int i = 0; i < 4; ++i) {
+        if (!qwen_bonsai2_close(inv[i], primal[i], 1e-6f)) return 10;
+    }
+
+    float tiled[12], grouped[12];
+    for (int i = 0; i < 12; ++i) tiled[i] = (float)i;
+    if (qwen_bonsai2_permute_gdn_ssm_out_f32(tiled, grouped, 12, 2, 2, 3) != 0) return 11;
+    const float grouped_expected[12] = {0,1,4,5,8,9,2,3,6,7,10,11};
+    for (int i = 0; i < 12; ++i) {
+        if (grouped[i] != grouped_expected[i]) return 12;
     }
 
     puts("QWEN38_BONSAI2_NATIVE_C_SELFTEST_PASS");
