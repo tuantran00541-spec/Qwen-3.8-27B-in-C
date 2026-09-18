@@ -286,7 +286,7 @@ def sanity():
 
 def main():
     ap=argparse.ArgumentParser(); sub=ap.add_subparsers(dest="cmd",required=True); sub.add_parser("sanity")
-    r=sub.add_parser("run"); r.add_argument("--model",type=Path,required=True); r.add_argument("--native-lib",type=Path,required=True); r.add_argument("--state-lib",type=Path,required=True); r.add_argument("--inventory",type=Path,required=True); r.add_argument("--oracle",type=Path,required=True); r.add_argument("--work-dir",type=Path,required=True); r.add_argument("--output",type=Path,required=True)
+    r=sub.add_parser("run"); r.add_argument("--model",type=Path,required=True); r.add_argument("--native-lib",type=Path,required=True); r.add_argument("--state-lib",type=Path,required=True); r.add_argument("--oracle",type=Path,required=True); r.add_argument("--work-dir",type=Path,required=True); r.add_argument("--output",type=Path,required=True); r.add_argument("--threads",type=int,default=4)
     a=ap.parse_args()
     if a.cmd=="sanity": sanity()
     else: a.work_dir.mkdir(parents=True,exist_ok=True); execute(a.model,a.native_lib,a.state_lib,a.oracle,a.work_dir,a.output,a.threads)
