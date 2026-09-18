@@ -126,8 +126,9 @@ class Bonsai2NativeRuntime:
             )
 
         sign_owner, sign_ptr = self._sign_array(n)
-        del sign_owner  # pointer is consumed synchronously by the native call
         rc = self.lib.qwen_bonsai2_fwht_blocks(arr, n, self.block_size, sign_ptr)
+        # Keep the ctypes sign array alive through the synchronous native call.
+        _ = sign_owner
         if rc != 0:
             raise RuntimeError(f"{weight_name}: native Hadamard failed rc={rc}")
         self.hadamard_transforms += 1
