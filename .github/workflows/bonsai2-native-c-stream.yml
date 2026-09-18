@@ -1,0 +1,94 @@
+name: Bonsai 2 native C K3 stream
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - qwen38/bonsai2_quant_runtime.py
+      - qwen38/bonsai2_k3_stream_probe.py
+      - qwen38/gguf_stream.py
+      - qwen38/gguf_k3_layout.py
+      - qwen38/k3_stream.py
+      - .github/workflows/bonsai2-native-c-stream.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ptq1-native-k3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Record CPU and memory
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/bonsai2-native
+          {
+            uname -a
+            lscpu
+            free -h
+          } | tee work/bonsai2-native/hardware.txt
+
+      - name: Compile native Bonsai 2 AVX2 selftest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gcc -O3 -std=c11 -mavx2 -mfma             -DQWEN_BONSAI2_QUANT_SELFTEST             qwen38/bonsai2_quant_dot_avx2.c             -lm -o work/bonsai2-native/bonsai2-selftest
+          ./work/bonsai2-native/bonsai2-selftest             | tee work/bonsai2-native/native-selftest.txt
+
+      - name: Build native Bonsai 2 shared library
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared             qwen38/bonsai2_quant_dot_avx2.c             -lm -o work/bonsai2-native/libbonsai2_quant.so
+          python -m py_compile             qwen38/bonsai2_quant_runtime.py             qwen38/bonsai2_k3_stream_probe.py             qwen38/gguf_stream.py             qwen38/gguf_k3_layout.py             qwen38/k3_stream.py
+
+      - name: Download verified PTQ1_0 GGUF
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p models/bonsai2
+          MODEL="models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+          URL="https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/6ed5e12bf84b7a63069882c91dd9e9218647d17b/Ternary-Bonsai-2-27B-PTQ1_0.gguf?download=true"
+          SHA="53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"
+          curl -fL --retry 10 --retry-all-errors -C - -o "$MODEL.part" "$URL"
+          echo "$SHA  $MODEL.part" | sha256sum -c -
+          mv "$MODEL.part" "$MODEL"
+
+      - name: Run real K3 streamed native C matvec
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/bonsai2-native/k3
+          /usr/bin/time -v python qwen38/bonsai2_k3_stream_probe.py             --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf             --native-lib work/bonsai2-native/libbonsai2_quant.so             --work-dir work/bonsai2-native/k3             --source-sha256 53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3             --output work/bonsai2-native/native-k3-result.json             > work/bonsai2-native/native-k3.stdout.txt             2> work/bonsai2-native/native-k3.stderr.txt
+          cat work/bonsai2-native/native-k3.stdout.txt
+          cat work/bonsai2-native/native-k3.stderr.txt
+
+      - name: Drop model before artifact upload
+        if: always()
+        shell: bash
+        run: |
+          rm -rf models/bonsai2
+          rm -f work/bonsai2-native/k3/layer0.k3.bin
+
+      - name: Upload native stream evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai2-native-c-k3-stream
+          path: |
+            work/bonsai2-native/*.json
+            work/bonsai2-native/*.txt
+            work/bonsai2-native/k3/*.json
+          if-no-files-found: warn
+          retention-days: 30
