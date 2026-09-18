@@ -1,0 +1,132 @@
+name: Bonsai 2 Python stateful profile
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Record hardware
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/bonsai2-python-profile
+          { uname -a; lscpu; free -h; df -h .; } | tee work/bonsai2-python-profile/hardware.txt
+
+      - name: Build native kernels
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared \
+            qwen38/bonsai2_persistent_pool_portable.c \
+            -pthread -lm \
+            -o work/bonsai2-python-profile/libbonsai2_quant.so
+          gcc -O3 -std=c11 -fPIC -shared \
+            qwen38/gdn_state_ar_portable_pool.c \
+            -pthread -lm \
+            -o work/bonsai2-python-profile/libgdn_state.so
+
+      - name: Build pinned Prism oracle
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none https://github.com/PrismML-Eng/llama.cpp.git prism-llama
+          git -C prism-llama checkout d8f26eec76da6d09bb708bcba51ef64b8cd868a3
+          mkdir -p prism-llama/examples/bonsai-two-token-oracle
+          cp qwen38/llama_full64_two_token_oracle.cpp prism-llama/examples/bonsai-two-token-oracle/main.cpp
+          cat > prism-llama/examples/bonsai-two-token-oracle/CMakeLists.txt <<'EOF'
+          add_executable(bonsai-two-token-oracle main.cpp)
+          target_link_libraries(bonsai-two-token-oracle PRIVATE llama)
+          target_compile_features(bonsai-two-token-oracle PRIVATE cxx_std_17)
+          EOF
+          printf '\nadd_subdirectory(examples/bonsai-two-token-oracle)\n' >> prism-llama/CMakeLists.txt
+          cmake -S prism-llama -B prism-llama/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build prism-llama/build --target bonsai-two-token-oracle --parallel 4
+
+      - name: Download verified PTQ1_0 GGUF
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p models/bonsai2
+          MODEL="models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+          URL="https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/6ed5e12bf84b7a63069882c91dd9e9218647d17b/Ternary-Bonsai-2-27B-PTQ1_0.gguf?download=true"
+          SHA="53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"
+          curl -fL --retry 10 --retry-all-errors -C - -o "$MODEL.part" "$URL"
+          echo "$SHA  $MODEL.part" | sha256sum -c -
+          mv "$MODEL.part" "$MODEL"
+
+      - name: Capture Prism position-1 oracle
+        shell: bash
+        run: |
+          set -euxo pipefail
+          prism-llama/build/bin/bonsai-two-token-oracle \
+            models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+            work/bonsai2-python-profile/prism-two-token-oracle.json \
+            > work/bonsai2-python-profile/prism.stdout.txt \
+            2> work/bonsai2-python-profile/prism.stderr.txt
+
+      - name: Profile stateful native two-token execution
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/bonsai2-python-profile/k3
+          /usr/bin/time -v python -m cProfile \
+            -o work/bonsai2-python-profile/two-token.prof \
+            qwen38/bonsai2_two_token.py run \
+            --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+            --native-lib work/bonsai2-python-profile/libbonsai2_quant.so \
+            --state-lib work/bonsai2-python-profile/libgdn_state.so \
+            --oracle work/bonsai2-python-profile/prism-two-token-oracle.json \
+            --work-dir work/bonsai2-python-profile/k3 \
+            --output work/bonsai2-python-profile/native-two-token-result.json \
+            --threads 4 \
+            > work/bonsai2-python-profile/native.stdout.txt \
+            2> work/bonsai2-python-profile/native.stderr.txt
+          python - <<'PY' > work/bonsai2-python-profile/profile-top.txt
+          import pstats
+          p = pstats.Stats("work/bonsai2-python-profile/two-token.prof")
+          print("=== cumulative ===")
+          p.sort_stats("cumulative").print_stats(80)
+          print("=== internal ===")
+          p.sort_stats("tottime").print_stats(80)
+          PY
+          cat work/bonsai2-python-profile/profile-top.txt
+          tail -n 80 work/bonsai2-python-profile/native.stdout.txt
+          cat work/bonsai2-python-profile/native.stderr.txt
+
+      - name: Drop large files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf models/bonsai2 prism-llama
+          rm -f work/bonsai2-python-profile/k3/decoder64.k3.bin
+
+      - name: Upload profile evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai2-python-stateful-profile
+          path: |
+            work/bonsai2-python-profile/*.json
+            work/bonsai2-python-profile/*.txt
+            work/bonsai2-python-profile/*.prof
+            work/bonsai2-python-profile/k3/*.json
+          if-no-files-found: warn
+          retention-days: 30
