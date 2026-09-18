@@ -48,9 +48,20 @@ def _load_sign_table(metadata: Mapping[str, object]) -> dict[int, tuple[int, ...
 
 
 class Bonsai2NativeRuntime:
-    def __init__(self, library: Path, metadata: Mapping[str, object]) -> None:
+    def __init__(
+        self,
+        library: Path,
+        metadata: Mapping[str, object],
+        *,
+        threads: int = 1,
+        max_rows: int = 300_000,
+    ) -> None:
         self.library = Path(library)
         self.lib = ctypes.CDLL(str(self.library))
+        self.threads = int(threads)
+        if self.threads < 1 or self.threads > 64:
+            raise ValueError("threads must be in [1,64]")
+        self.pool = None
 
         self.lib.qwen_quantize_q8_0_scalar.argtypes = [
             _C_FP, ctypes.c_size_t, _C_U8P, ctypes.c_size_t
@@ -77,6 +88,45 @@ class Bonsai2NativeRuntime:
             _C_FP, ctypes.c_size_t, ctypes.c_size_t, _C_I8P
         ]
         self.lib.qwen_bonsai2_fwht_blocks.restype = ctypes.c_int
+
+        if hasattr(self.lib, "qwen_bonsai2_pool_create"):
+            self.lib.qwen_bonsai2_pool_create.argtypes = [
+                ctypes.c_int, ctypes.c_size_t
+            ]
+            self.lib.qwen_bonsai2_pool_create.restype = ctypes.c_void_p
+            self.lib.qwen_bonsai2_pool_destroy.argtypes = [ctypes.c_void_p]
+            self.lib.qwen_bonsai2_pool_destroy.restype = None
+            for name in (
+                "qwen_bonsai2_pool_matvec_ptq1_0",
+                "qwen_bonsai2_pool_matvec_pq2_0",
+            ):
+                fn = getattr(self.lib, name)
+                fn.argtypes = [
+                    ctypes.c_void_p,
+                    _C_U8P,
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                    _C_U8P,
+                    ctypes.c_size_t,
+                    _C_FP,
+                ]
+                fn.restype = ctypes.c_int
+            self.lib.qwen_bonsai2_pool_calls.argtypes = [ctypes.c_void_p]
+            self.lib.qwen_bonsai2_pool_calls.restype = ctypes.c_uint64
+            self.lib.qwen_bonsai2_pool_threads.argtypes = [ctypes.c_void_p]
+            self.lib.qwen_bonsai2_pool_threads.restype = ctypes.c_int
+            self.pool = self.lib.qwen_bonsai2_pool_create(
+                self.threads, int(max_rows)
+            )
+            if not self.pool:
+                raise RuntimeError(
+                    f"failed to create Bonsai 2 persistent pool threads={self.threads}"
+                )
+        elif self.threads != 1:
+            raise RuntimeError(
+                "native library has no Bonsai 2 persistent pool but threads > 1"
+            )
 
         version = int(metadata.get("prism.hadamard.version", 0))
         if version != 1:
@@ -165,15 +215,23 @@ class Bonsai2NativeRuntime:
                 f"expected={expected_activation_bytes}"
             )
         if kind == "PTQ1_0":
-            fn = self.lib.qwen_bonsai2_matvec_ptq1_0_q8_0
+            fn = (
+                self.lib.qwen_bonsai2_pool_matvec_ptq1_0
+                if self.pool
+                else self.lib.qwen_bonsai2_matvec_ptq1_0_q8_0
+            )
         elif kind == "PQ2_0":
-            fn = self.lib.qwen_bonsai2_matvec_pq2_0_q8_0
+            fn = (
+                self.lib.qwen_bonsai2_pool_matvec_pq2_0
+                if self.pool
+                else self.lib.qwen_bonsai2_matvec_pq2_0_q8_0
+            )
         else:
             raise ValueError(f"unsupported Bonsai 2 native matvec type {kind}")
 
         w_arr = (ctypes.c_uint8 * len(weights)).from_buffer(weights)
         out = (ctypes.c_float * rows)()
-        rc = fn(
+        common = (
             w_arr,
             len(weights),
             rows,
@@ -182,6 +240,7 @@ class Bonsai2NativeRuntime:
             activation_bytes,
             out,
         )
+        rc = fn(self.pool, *common) if self.pool else fn(*common)
         if rc != 0:
             raise RuntimeError(f"{meta['name']}: native Bonsai 2 matvec failed rc={rc}")
         self.matvec_rows += rows
@@ -202,6 +261,12 @@ class Bonsai2NativeRuntime:
     def report(self) -> dict[str, object]:
         return {
             "backend": "native-c-avx2-k3",
+            "threads": self.threads,
+            "persistent_pool": bool(self.pool),
+            "pool_calls": (
+                int(self.lib.qwen_bonsai2_pool_calls(self.pool))
+                if self.pool else 0
+            ),
             "hadamard_block_size": self.block_size,
             "hadamard_sign_mode": self.sign_mode,
             "folded_weight_count": len(self.folded_weights),
@@ -211,3 +276,15 @@ class Bonsai2NativeRuntime:
             "hadamard_transforms": self.hadamard_transforms,
             "matvec_rows": self.matvec_rows,
         }
+
+
+    def close(self) -> None:
+        if self.pool:
+            self.lib.qwen_bonsai2_pool_destroy(self.pool)
+            self.pool = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
