@@ -5,6 +5,9 @@ on:
     branches:
       - test/bonsai2-27b
     paths:
+      - qwen38/bonsai2_two_token.py
+      - qwen38/bonsai2_quant_runtime.py
+      - qwen38/bonsai2_quant_dot_avx2.c
       - .github/workflows/bonsai2-python-profile.yml
   workflow_dispatch:
 
