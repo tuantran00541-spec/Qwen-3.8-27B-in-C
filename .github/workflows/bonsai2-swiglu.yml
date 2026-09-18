@@ -6,6 +6,7 @@ on:
       - test/bonsai2-27b
     paths:
       - qwen38/test_bonsai2_native_swiglu.py
+      - qwen38/test_bonsai2_ffn_swiglu_integration.py
       - qwen38/bonsai2_quant_runtime.py
       - qwen38/bonsai2_quant_dot_avx2.c
       - qwen38/bonsai2_persistent_pool_portable.c
@@ -38,3 +39,8 @@ jobs:
           set -euxo pipefail
           python qwen38/test_bonsai2_native_swiglu.py \
             --native-lib work/swiglu/libbonsai2_quant.so
+      - name: Run FFN native SwiGLU integration gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python qwen38/test_bonsai2_ffn_swiglu_integration.py
