@@ -1,0 +1,119 @@
+name: Bonsai 2 real prompt spike
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/bonsai2_prompt_spike.py
+      - qwen38/bonsai2_full64_one_token.py
+      - qwen38/bonsai2_two_token.py
+      - qwen38/bonsai2_quant_runtime.py
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - qwen38/bonsai2_persistent_pool_portable.c
+      - qwen38/gdn_state_ar_portable_pool.c
+      - qwen38/qwen_thread_compat.h
+      - .github/workflows/bonsai2-prompt-spike.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-prompt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Record runner
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/bonsai2-prompt
+          { uname -a; lscpu; free -h; df -h .; } | tee work/bonsai2-prompt/hardware.txt
+
+      - name: Build native runtime and tokenizer dependency
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared \
+            qwen38/bonsai2_persistent_pool_portable.c \
+            -pthread -lm \
+            -o work/bonsai2-prompt/libbonsai2_quant.so
+          gcc -O3 -std=c11 -fPIC -shared \
+            qwen38/gdn_state_ar_portable_pool.c \
+            -pthread -lm \
+            -o work/bonsai2-prompt/libgdn_state.so
+          python -m pip install --disable-pip-version-check tokenizers
+          python -m py_compile \
+            qwen38/bonsai2_prompt_spike.py \
+            qwen38/bonsai2_full64_one_token.py \
+            qwen38/bonsai2_two_token.py \
+            qwen38/bonsai2_quant_runtime.py
+
+      - name: Download verified model and pinned tokenizer
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p models/bonsai2 models/qwen-official
+
+          MODEL="models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+          MODEL_URL="https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/6ed5e12bf84b7a63069882c91dd9e9218647d17b/Ternary-Bonsai-2-27B-PTQ1_0.gguf?download=true"
+          MODEL_SHA="53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"
+          curl -fL --retry 10 --retry-all-errors -C - -o "$MODEL.part" "$MODEL_URL"
+          echo "$MODEL_SHA  $MODEL.part" | sha256sum -c -
+          mv "$MODEL.part" "$MODEL"
+
+          TOKENIZER="models/qwen-official/tokenizer.json"
+          TOKENIZER_URL="https://huggingface.co/Qwen/Qwen3.8-27B/resolve/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/tokenizer.json?download=true"
+          TOKENIZER_SHA="0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+          curl -fL --retry 10 --retry-all-errors -o "$TOKENIZER.part" "$TOKENIZER_URL"
+          echo "$TOKENIZER_SHA  $TOKENIZER.part" | sha256sum -c -
+          mv "$TOKENIZER.part" "$TOKENIZER"
+          df -h .
+
+      - name: Run real multi-token prompt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/bonsai2-prompt/k3
+          PROMPT='Reply with exactly this text and nothing else: Hello from Bonsai 2!'
+          /usr/bin/time -v python qwen38/bonsai2_prompt_spike.py \
+            --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+            --native-lib work/bonsai2-prompt/libbonsai2_quant.so \
+            --state-lib work/bonsai2-prompt/libgdn_state.so \
+            --tokenizer-json models/qwen-official/tokenizer.json \
+            --prompt "$PROMPT" \
+            --max-new-tokens 12 \
+            --threads 4 \
+            --work-dir work/bonsai2-prompt/k3 \
+            --output work/bonsai2-prompt/prompt-result.json \
+            > work/bonsai2-prompt/prompt.stdout.txt \
+            2> work/bonsai2-prompt/prompt.stderr.txt
+          tail -n 240 work/bonsai2-prompt/prompt.stdout.txt
+          cat work/bonsai2-prompt/prompt.stderr.txt
+
+      - name: Drop large files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf models/bonsai2 models/qwen-official
+          rm -f work/bonsai2-prompt/k3/decoder64.k3.bin
+          df -h .
+
+      - name: Upload prompt evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai2-real-prompt-spike
+          path: |
+            work/bonsai2-prompt/*.json
+            work/bonsai2-prompt/*.txt
+            work/bonsai2-prompt/k3/*.json
+          if-no-files-found: warn
+          retention-days: 30
