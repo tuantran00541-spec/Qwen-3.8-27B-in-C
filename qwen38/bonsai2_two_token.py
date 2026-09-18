@@ -52,12 +52,49 @@ def softplusf(x: float) -> float:
     return f32(math.log1p(float(exact.expf(xf))))
 
 
-def load_state_lib(path: Path):
-    lib = ctypes.CDLL(str(path))
-    fp = ctypes.POINTER(ctypes.c_float)
-    lib.qwen_gdn_ar_step_f32.argtypes = [fp, fp, fp, fp, fp, fp, fp]
-    lib.qwen_gdn_ar_step_f32.restype = ctypes.c_int
-    return lib
+class GDNStateRuntime:
+    def __init__(self, path: Path, threads: int):
+        self.lib = ctypes.CDLL(str(path))
+        fp = ctypes.POINTER(ctypes.c_float)
+        self.lib.qwen_gdn_pool_create.argtypes = [ctypes.c_int]
+        self.lib.qwen_gdn_pool_create.restype = ctypes.c_void_p
+        self.lib.qwen_gdn_pool_destroy.argtypes = [ctypes.c_void_p]
+        self.lib.qwen_gdn_pool_destroy.restype = None
+        self.lib.qwen_gdn_pool_step_f32.argtypes = [
+            ctypes.c_void_p, fp, fp, fp, fp, fp, fp, fp
+        ]
+        self.lib.qwen_gdn_pool_step_f32.restype = ctypes.c_int
+        self.lib.qwen_gdn_pool_threads.argtypes = [ctypes.c_void_p]
+        self.lib.qwen_gdn_pool_threads.restype = ctypes.c_int
+        self.lib.qwen_gdn_pool_calls.argtypes = [ctypes.c_void_p]
+        self.lib.qwen_gdn_pool_calls.restype = ctypes.c_uint64
+
+        self.pool = self.lib.qwen_gdn_pool_create(int(threads))
+        if not self.pool:
+            raise RuntimeError(f"failed to create GDN state pool threads={threads}")
+
+    def step(self, state, q, k, v, gate, beta, out) -> int:
+        return int(self.lib.qwen_gdn_pool_step_f32(
+            self.pool, state, q, k, v, gate, beta, out
+        ))
+
+    def report(self) -> dict[str, int | bool]:
+        if not self.pool:
+            return {"persistent_pool": False, "threads": 0, "calls": 0}
+        return {
+            "persistent_pool": True,
+            "threads": int(self.lib.qwen_gdn_pool_threads(self.pool)),
+            "calls": int(self.lib.qwen_gdn_pool_calls(self.pool)),
+        }
+
+    def close(self) -> None:
+        if self.pool:
+            self.lib.qwen_gdn_pool_destroy(self.pool)
+            self.pool = None
+
+
+def load_state_lib(path: Path, threads: int) -> GDNStateRuntime:
+    return GDNStateRuntime(path, threads)
 
 
 def carr(values: Sequence[float]):
@@ -133,7 +170,9 @@ def recurrent_step(runtime, state_lib, state, prev_qkv, view, metas, vec,
     k48 = repeat_k_heads(kn)
 
     out_buf = (ctypes.c_float * gdn.VALUE_DIM)()
-    rc = state_lib.qwen_gdn_ar_step_f32(state, carr(q48), carr(k48), carr(v), carr(gate), carr(beta), out_buf)
+    rc = state_lib.step(
+        state, carr(q48), carr(k48), carr(v), carr(gate), carr(beta), out_buf
+    )
     if rc != 0: raise RuntimeError(f"layer {layer}: GDN state kernel rc={rc}")
     core = [float(out_buf[i]) for i in range(gdn.VALUE_DIM)]
 
@@ -215,7 +254,7 @@ def execute(model: Path, native_lib: Path, state_lib_path: Path,
     trunk=work_dir/"decoder64.k3.bin"; manifest_path=work_dir/"decoder64.k3.json"
     manifest=pack_gguf_layers(directory,trunk,manifest_path,layers=range(N_LAYER),model_id=base.MODEL_ID,revision=base.MODEL_REVISION,source_sha256=base.MODEL_SHA256,expected_layers=N_LAYER)
     max_layer=max(int(x["read_bytes"]) for x in manifest["layers"])
-    runtime=Bonsai2NativeRuntime(native_lib,directory.metadata,threads=threads,max_rows=base.VOCAB); state_lib=load_state_lib(state_lib_path)
+    runtime=Bonsai2NativeRuntime(native_lib,directory.metadata,threads=threads,max_rows=base.VOCAB); state_lib=load_state_lib(state_lib_path, threads)
     states={il:(ctypes.c_float*STATE_ELEMS)() for il in range(N_LAYER) if il%4!=3}
     prev_qkv:dict[int,list[float]]={}; caches={il:{"k":[],"v":[]} for il in range(N_LAYER) if il%4==3}
 
@@ -267,9 +306,10 @@ def execute(model: Path, native_lib: Path, state_lib_path: Path,
         "rope_checkpoint_metrics":rope_metrics,
         "final_metrics":{"post_ffn-63":base.metrics(ref["post_ffn-63"],token1_final),"result_norm":base.metrics(ref["result_norm"],result_norm),"result_output":base.metrics(ref_logits,logits)},
         "state":{"recurrent_layers":48,"gdn_state_bytes_f32":48*STATE_BYTES_PER_LAYER,"conv_history_current_bytes_f32":48*gdn.CONV_DIM*4,"attention_kv_bytes_f16":16*2*2*attn.KV_DIM},
-        "candidate":{"reader_report":reader_report,"runtime":runtime.report(),"native_gdn_state_kernel":True},
+        "candidate":{"reader_report":reader_report,"runtime":runtime.report(),"state_runtime":state_lib.report(),"native_gdn_state_kernel":True},
         "elapsed_seconds":time.monotonic()-started,"max_rss_gib":rss_gib(),
     }
+    state_lib.close()
     runtime.close()
     output.write_text(json.dumps(result,indent=2,sort_keys=True)+"\n"); print(json.dumps(result,indent=2,sort_keys=True))
     if token2!=oracle_token2: raise SystemExit(1)
