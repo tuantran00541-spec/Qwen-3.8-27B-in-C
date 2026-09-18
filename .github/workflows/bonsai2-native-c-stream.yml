@@ -7,7 +7,7 @@ on:
     paths:
       - qwen38/bonsai2_quant_dot_avx2.c
       - qwen38/bonsai2_quant_runtime.py
-      - qwen38/bonsai2_persistent_pool.c
+      - qwen38/bonsai2_persistent_pool_portable.c
       - qwen38/bonsai2_k3_stream_probe.py
       - qwen38/gguf_stream.py
       - qwen38/gguf_k3_layout.py
@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared qwen38/bonsai2_persistent_pool.c -pthread -lm -o work/bonsai2-native/libbonsai2_quant.so
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared qwen38/bonsai2_persistent_pool_portable.c -pthread -lm -o work/bonsai2-native/libbonsai2_quant.so
           python -m py_compile qwen38/bonsai2_quant_runtime.py qwen38/bonsai2_k3_stream_probe.py qwen38/gguf_stream.py qwen38/gguf_k3_layout.py qwen38/k3_stream.py
 
       - name: Download verified PTQ1_0 GGUF
