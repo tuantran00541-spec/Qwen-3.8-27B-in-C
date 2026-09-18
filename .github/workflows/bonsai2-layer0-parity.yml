@@ -1,0 +1,113 @@
+name: Bonsai 2 native layer0 parity
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - qwen38/bonsai2_quant_runtime.py
+      - qwen38/bonsai2_persistent_pool.c
+      - qwen38/bonsai2_layer0_gate.py
+      - qwen38/llama_layer0_oracle.cpp
+      - qwen38/gguf_stream.py
+      - qwen38/gguf_k3_layout.py
+      - qwen38/k3_stream.py
+      - .github/workflows/bonsai2-layer0-parity.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  layer0-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Record hardware
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/bonsai2-layer0
+          {
+            uname -a
+            lscpu
+            free -h
+          } | tee work/bonsai2-layer0/hardware.txt
+
+      - name: Build custom native Bonsai 2 runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared             qwen38/bonsai2_persistent_pool.c             -pthread -lm             -o work/bonsai2-layer0/libbonsai2_quant.so
+          python -m py_compile             qwen38/bonsai2_quant_runtime.py             qwen38/bonsai2_layer0_gate.py             qwen38/gguf_stream.py             qwen38/gguf_k3_layout.py             qwen38/k3_stream.py
+
+      - name: Build pinned Prism layer0 oracle
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none https://github.com/PrismML-Eng/llama.cpp.git prism-llama
+          git -C prism-llama checkout d8f26eec76da6d09bb708bcba51ef64b8cd868a3
+          mkdir -p prism-llama/examples/bonsai-layer0-oracle
+          cp qwen38/llama_layer0_oracle.cpp prism-llama/examples/bonsai-layer0-oracle/main.cpp
+          cat > prism-llama/examples/bonsai-layer0-oracle/CMakeLists.txt <<'EOF'
+          add_executable(bonsai-layer0-oracle main.cpp)
+          target_link_libraries(bonsai-layer0-oracle PRIVATE llama)
+          target_compile_features(bonsai-layer0-oracle PRIVATE cxx_std_17)
+          EOF
+          printf '\nadd_subdirectory(examples/bonsai-layer0-oracle)\n' >> prism-llama/CMakeLists.txt
+          cmake -S prism-llama -B prism-llama/build -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DGGML_NATIVE=OFF             -DGGML_OPENMP=ON             -DLLAMA_CURL=OFF             -DLLAMA_BUILD_SERVER=OFF             -DLLAMA_BUILD_TESTS=OFF             -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build prism-llama/build --target bonsai-layer0-oracle --parallel 4
+
+      - name: Download verified PTQ1_0 GGUF
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p models/bonsai2
+          MODEL="models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+          URL="https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/6ed5e12bf84b7a63069882c91dd9e9218647d17b/Ternary-Bonsai-2-27B-PTQ1_0.gguf?download=true"
+          SHA="53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"
+          curl -fL --retry 10 --retry-all-errors -C - -o "$MODEL.part" "$URL"
+          echo "$SHA  $MODEL.part" | sha256sum -c -
+          mv "$MODEL.part" "$MODEL"
+
+      - name: Capture Prism layer0 oracle
+        shell: bash
+        run: |
+          set -euxo pipefail
+          /usr/bin/time -v prism-llama/build/bin/bonsai-layer0-oracle             models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf             work/bonsai2-layer0/prism-layer0-oracle.json             > work/bonsai2-layer0/prism-oracle.stdout.txt             2> work/bonsai2-layer0/prism-oracle.stderr.txt
+          tail -n 80 work/bonsai2-layer0/prism-oracle.stderr.txt
+
+      - name: Run native K3 layer0 parity
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/bonsai2-layer0/k3
+          /usr/bin/time -v python qwen38/bonsai2_layer0_gate.py             --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf             --native-lib work/bonsai2-layer0/libbonsai2_quant.so             --oracle work/bonsai2-layer0/prism-layer0-oracle.json             --work-dir work/bonsai2-layer0/k3             --output work/bonsai2-layer0/native-layer0-result.json             --threads 4             > work/bonsai2-layer0/native-layer0.stdout.txt             2> work/bonsai2-layer0/native-layer0.stderr.txt
+          cat work/bonsai2-layer0/native-layer0.stdout.txt
+          cat work/bonsai2-layer0/native-layer0.stderr.txt
+
+      - name: Drop large files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf models/bonsai2 prism-llama
+          rm -f work/bonsai2-layer0/k3/layer0.k3.bin
+
+      - name: Upload parity evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai2-native-layer0-parity
+          path: |
+            work/bonsai2-layer0/*.json
+            work/bonsai2-layer0/*.txt
+            work/bonsai2-layer0/k3/*.json
+          if-no-files-found: warn
+          retention-days: 30
