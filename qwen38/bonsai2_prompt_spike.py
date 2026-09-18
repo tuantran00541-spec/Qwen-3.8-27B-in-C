@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""LAB-ONLY real prompt spike for Ternary Bonsai 2 27B.
+
+This is intentionally not wired into the user-facing launcher yet. It reuses the
+verified Bonsai 2 PTQ1 native-C/K3 path and the portable persistent GDN state pool
+to exercise:
+  text -> pinned Qwen3.8 tokenizer -> multi-token prefill -> stateful decode
+  -> streamed low-bit LM head -> greedy text.
+
+The spike is kept on test/bonsai2-27b until a real prompt run is inspected.
+"""
+from __future__ import annotations
+
+import argparse
+from array import array
+import json
+import math
+from pathlib import Path
+import time
+from typing import Any, Sequence
+
+import bonsai2_full64_one_token as base
+import bonsai2_two_token as t2
+from bonsai2_quant_runtime import Bonsai2NativeRuntime
+from gguf_k3_layout import pack_gguf_layers
+from gguf_stream import parse_gguf
+from k3_stream import K3Trunk
+import qwen35_full_attn_layer3_gate as attn
+import qwen35_gdn_quant_layer_gate as gdn
+import qwen35_k3_full64_ggml_exact as exact
+import qwen35_k3_full64_ggml_rmsnorm as rmswrap
+import qwen35_k3_generate as textgen
+
+N_LAYER = 64
+EOS_IDS = {248044, 248046}
+
+
+def f32(x: float) -> float:
+    return exact.f32(x)
+
+
+def addf(a: float, b: float) -> float:
+    return t2.addf(a, b)
+
+
+def mulf(a: float, b: float) -> float:
+    return t2.mulf(a, b)
+
+
+def softmax_many(scores: Sequence[float]) -> list[float]:
+    if not scores:
+        raise ValueError("softmax requires at least one score")
+    m = max(float(x) for x in scores)
+    exps = [f32(exact.expf(f32(float(x) - m))) for x in scores]
+    denom = f32(0.0)
+    for value in exps:
+        denom = addf(denom, value)
+    return [f32(value / denom) for value in exps]
+
+
+def recurrent_step(
+    runtime: Bonsai2NativeRuntime,
+    state_lib: t2.GDNStateRuntime,
+    state,
+    history: Sequence[Sequence[float]],
+    view,
+    metas,
+    vec,
+    hidden: Sequence[float],
+    layer: int,
+) -> tuple[list[float], list[float]]:
+    p = f"blk.{layer}"
+    x = gdn.rms_norm(hidden, vec("attn_norm.weight"))
+
+    prepared = runtime.prepare_activation(f"{p}.attn_qkv.weight", x)
+    qkv = runtime.matvec_prepared(
+        view("attn_qkv.weight"), metas[f"{p}.attn_qkv.weight"], prepared
+    )
+    z = runtime.matvec_prepared(
+        view("attn_gate.weight"), metas[f"{p}.attn_gate.weight"], prepared
+    )
+    beta_raw = runtime.matvec(
+        view("ssm_beta.weight"), metas[f"{p}.ssm_beta.weight"], x
+    )
+    alpha = runtime.matvec(
+        view("ssm_alpha.weight"), metas[f"{p}.ssm_alpha.weight"], x
+    )
+    beta = [exact.sigmoid_f32(value) for value in beta_raw]
+    dt = vec("ssm_dt.bias")
+    aa = vec("ssm_a")
+    gate = [
+        mulf(aa[h], t2.softplusf(addf(alpha[h], dt[h])))
+        for h in range(gdn.V_HEADS)
+    ]
+
+    kernels = vec("ssm_conv1d.weight")
+    prior = list(history[-3:])
+    conv = [0.0] * gdn.CONV_DIM
+    for c in range(gdn.CONV_DIM):
+        current = mulf(qkv[c], kernels[c * gdn.CONV_KERNEL + 3])
+        for lag, old in enumerate(reversed(prior), start=1):
+            current = addf(
+                current,
+                mulf(old[c], kernels[c * gdn.CONV_KERNEL + 3 - lag]),
+            )
+        conv[c] = t2.siluf(current)
+
+    q = conv[: gdn.KEY_DIM]
+    k = conv[gdn.KEY_DIM : 2 * gdn.KEY_DIM]
+    v = conv[2 * gdn.KEY_DIM :]
+    qn = gdn.flatten([
+        gdn.l2_norm(head) for head in gdn.split_heads(q, gdn.K_HEADS)
+    ])
+    kn = gdn.flatten([
+        gdn.l2_norm(head) for head in gdn.split_heads(k, gdn.K_HEADS)
+    ])
+    q48 = [mulf(value, t2.SCALE_GDN) for value in t2.repeat_k_heads(qn)]
+    k48 = t2.repeat_k_heads(kn)
+
+    out_buf = (t2.ctypes.c_float * gdn.VALUE_DIM)()
+    rc = state_lib.step(
+        state,
+        t2.carr(q48),
+        t2.carr(k48),
+        t2.carr(v),
+        t2.carr(gate),
+        t2.carr(beta),
+        out_buf,
+    )
+    if rc != 0:
+        raise RuntimeError(f"layer {layer}: GDN state pool rc={rc}")
+    core = [float(out_buf[i]) for i in range(gdn.VALUE_DIM)]
+
+    norm_w = vec("ssm_norm.weight")
+    core_heads = gdn.split_heads(core, gdn.V_HEADS)
+    z_heads = gdn.split_heads(z, gdn.V_HEADS)
+    gated: list[float] = []
+    for core_head, z_head in zip(core_heads, z_heads):
+        normalized = rmswrap.ggml_rms_norm(core_head, norm_w, gdn.RMS_EPS)
+        gated.extend(
+            mulf(normalized[d], t2.siluf(z_head[d]))
+            for d in range(gdn.HEAD_DIM)
+        )
+
+    linear = runtime.matvec(
+        view("ssm_out.weight"), metas[f"{p}.ssm_out.weight"], gated
+    )
+    residual = [addf(hidden[i], linear[i]) for i in range(gdn.HIDDEN)]
+    post = gdn.rms_norm(residual, vec("post_attention_norm.weight"))
+    ffn = t2.ffn(runtime, view, metas, p, post)
+    return [addf(residual[i], ffn[i]) for i in range(gdn.HIDDEN)], qkv
+
+
+def full_attention_step(
+    runtime: Bonsai2NativeRuntime,
+    cache: dict[str, list[list[float]]],
+    view,
+    metas,
+    vec,
+    hidden: Sequence[float],
+    layer: int,
+    position: int,
+) -> list[float]:
+    p = f"blk.{layer}"
+    x = gdn.rms_norm(hidden, vec("attn_norm.weight"))
+
+    prepared = runtime.prepare_activation(f"{p}.attn_q.weight", x)
+    qg = runtime.matvec_prepared(
+        view("attn_q.weight"), metas[f"{p}.attn_q.weight"], prepared
+    )
+    k = runtime.matvec_prepared(
+        view("attn_k.weight"), metas[f"{p}.attn_k.weight"], prepared
+    )
+    v = runtime.matvec_prepared(
+        view("attn_v.weight"), metas[f"{p}.attn_v.weight"], prepared
+    )
+
+    q, gate = attn.split_q_gate(qg)
+    q = attn.rms_norm_heads(q, attn.N_HEAD, vec("attn_q_norm.weight"))
+    k = attn.rms_norm_heads(k, attn.N_HEAD_KV, vec("attn_k_norm.weight"))
+    q_rope = t2.rope_text_neox(q, attn.N_HEAD, position)
+    k_rope = t2.rope_text_neox(k, attn.N_HEAD_KV, position)
+
+    cache["k"].append(attn.f16_roundtrip(k_rope))
+    cache["v"].append(attn.f16_roundtrip(v))
+    n_ctx = len(cache["k"])
+
+    q_heads = attn.split_heads(q_rope, attn.N_HEAD)
+    pregate: list[float] = []
+    for q_index in range(attn.N_HEAD):
+        kv_head = q_index // attn.GQA_REPEAT
+        qv = q_heads[q_index]
+        scores: list[float] = []
+        for token_index in range(n_ctx):
+            kh = cache["k"][token_index][
+                kv_head * attn.HEAD_DIM : (kv_head + 1) * attn.HEAD_DIM
+            ]
+            scores.append(
+                f32(
+                    math.fsum(
+                        float(qv[d]) * float(kh[d])
+                        for d in range(attn.HEAD_DIM)
+                    )
+                    * t2.SCALE_ATTN
+                )
+            )
+        probs = softmax_many(scores)
+        for d in range(attn.HEAD_DIM):
+            acc = f32(0.0)
+            for token_index in range(n_ctx):
+                value = cache["v"][token_index][kv_head * attn.HEAD_DIM + d]
+                acc = addf(acc, mulf(probs[token_index], value))
+            pregate.append(acc)
+
+    gate_sigmoid = [exact.sigmoid_f32(value) for value in gate]
+    gated = [
+        mulf(pregate[i], gate_sigmoid[i])
+        for i in range(attn.Q_DIM)
+    ]
+    attn_out = runtime.matvec(
+        view("attn_output.weight"), metas[f"{p}.attn_output.weight"], gated
+    )
+    residual = [addf(hidden[i], attn_out[i]) for i in range(gdn.HIDDEN)]
+    post = gdn.rms_norm(residual, vec("post_attention_norm.weight"))
+    ffn = t2.ffn(runtime, view, metas, p, post)
+    return [addf(residual[i], ffn[i]) for i in range(gdn.HIDDEN)]
+
+
+class StatefulBonsai2Generator:
+    def __init__(
+        self,
+        model: Path,
+        native_lib: Path,
+        state_lib_path: Path,
+        work_dir: Path,
+        threads: int,
+    ) -> None:
+        exact.install()
+        self.model = model
+        self.directory = parse_gguf(model)
+        if self.directory.metadata.get("general.architecture") != "qwen35":
+            raise ValueError("Bonsai 2 prompt spike requires qwen35 GGUF")
+        self.tensors = self.directory.by_name()
+        self.runtime = Bonsai2NativeRuntime(
+            native_lib,
+            self.directory.metadata,
+            threads=threads,
+            max_rows=base.VOCAB,
+        )
+        self.state_lib = t2.load_state_lib(state_lib_path, threads)
+        self.states = {
+            layer: (t2.ctypes.c_float * t2.STATE_ELEMS)()
+            for layer in range(N_LAYER)
+            if layer % 4 != 3
+        }
+        self.conv_history: dict[int, list[array]] = {
+            layer: []
+            for layer in range(N_LAYER)
+            if layer % 4 != 3
+        }
+        self.caches = {
+            layer: {"k": [], "v": []}
+            for layer in range(N_LAYER)
+            if layer % 4 == 3
+        }
+        self.position = 0
+
+        work_dir.mkdir(parents=True, exist_ok=True)
+        trunk = work_dir / "decoder64.k3.bin"
+        manifest_path = work_dir / "decoder64.k3.json"
+        self.manifest = pack_gguf_layers(
+            self.directory,
+            trunk,
+            manifest_path,
+            layers=range(N_LAYER),
+            model_id=base.MODEL_ID,
+            revision=base.MODEL_REVISION,
+            source_sha256=base.MODEL_SHA256,
+            expected_layers=N_LAYER,
+        )
+        max_layer_bytes = max(
+            int(layer["read_bytes"]) for layer in self.manifest["layers"]
+        )
+        self.reader = K3Trunk(
+            trunk,
+            manifest_path,
+            budget_bytes=2 * max_layer_bytes,
+            want_ring=2,
+            max_pinned=0,
+            prefer_direct_io=True,
+        )
+        self.output_norm = base.read_f32_global(
+            model, self.tensors["output_norm.weight"]
+        )
+
+    def close(self) -> None:
+        try:
+            self.reader.close()
+        finally:
+            self.state_lib.close()
+            self.runtime.close()
+
+    def step(self, token_id: int) -> list[float]:
+        hidden = base.embedding_row(
+            self.model, self.directory, self.runtime, int(token_id)
+        )
+        position = self.position
+
+        for layer in range(N_LAYER):
+            bound = self.reader.bind(layer)
+            if layer + 1 < N_LAYER:
+                self.reader.prefetch(layer + 1)
+            metas = base.layer_meta(self.manifest, layer)
+            prefix = f"blk.{layer}"
+
+            def view(suffix: str):
+                return self.reader.tensor_view(bound, f"{prefix}.{suffix}")
+
+            def vec(suffix: str) -> list[float]:
+                return gdn.f32_vector(view(suffix))
+
+            if layer % 4 == 3:
+                hidden = full_attention_step(
+                    self.runtime,
+                    self.caches[layer],
+                    view,
+                    metas,
+                    vec,
+                    hidden,
+                    layer,
+                    position,
+                )
+            else:
+                hidden, qkv = recurrent_step(
+                    self.runtime,
+                    self.state_lib,
+                    self.states[layer],
+                    self.conv_history[layer],
+                    view,
+                    metas,
+                    vec,
+                    hidden,
+                    layer,
+                )
+                history = self.conv_history[layer]
+                history.append(array("f", qkv))
+                if len(history) > 3:
+                    del history[0]
+            bound.release()
+
+        self.position += 1
+        return hidden
+
+    def logits(self, hidden: Sequence[float]) -> list[float]:
+        normalized = gdn.rms_norm(hidden, self.output_norm)
+        return base.stream_lowbit_logits(
+            self.model,
+            self.tensors["output.weight"],
+            self.runtime,
+            normalized,
+        )
+
+    def report(self) -> dict[str, Any]:
+        conv_bytes = sum(
+            len(history) * gdn.CONV_DIM * 4
+            for history in self.conv_history.values()
+        )
+        kv_bytes = 0
+        for cache in self.caches.values():
+            kv_bytes += sum(len(value) * 2 for value in cache["k"])
+            kv_bytes += sum(len(value) * 2 for value in cache["v"])
+        return {
+            "position": self.position,
+            "gdn_state_bytes_f32": 48 * t2.STATE_BYTES_PER_LAYER,
+            "conv_history_bytes_f32": conv_bytes,
+            "attention_kv_bytes_f16": kv_bytes,
+            "reader": self.reader.report(),
+            "lowbit_runtime": self.runtime.report(),
+            "gdn_state_runtime": self.state_lib.report(),
+        }
+
+
+def run(
+    model: Path,
+    native_lib: Path,
+    state_lib: Path,
+    tokenizer_json: Path,
+    prompt: str,
+    max_new_tokens: int,
+    work_dir: Path,
+    output: Path,
+    threads: int,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    tokenizer = textgen.load_tokenizer(tokenizer_json)
+    rendered, prompt_ids = textgen.encode_prompt(tokenizer, prompt, raw=False)
+    if not prompt_ids:
+        raise RuntimeError("empty prompt tokenization")
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be positive")
+
+    engine = StatefulBonsai2Generator(
+        model, native_lib, state_lib, work_dir, threads
+    )
+    generated: list[int] = []
+    token_reports: list[dict[str, Any]] = []
+    prefill_seconds: list[float] = []
+    decode_seconds: list[float] = []
+
+    try:
+        hidden = None
+        for index, token_id in enumerate(prompt_ids):
+            t0 = time.monotonic()
+            hidden = engine.step(token_id)
+            elapsed = time.monotonic() - t0
+            prefill_seconds.append(elapsed)
+            print(json.dumps({
+                "phase": "prefill",
+                "index": index,
+                "token": int(token_id),
+                "position": engine.position,
+                "seconds": elapsed,
+            }), flush=True)
+        assert hidden is not None
+
+        for index in range(max_new_tokens):
+            t0 = time.monotonic()
+            logits = engine.logits(hidden)
+            top5 = base.topk(logits, 5)
+            token_id = int(top5[0]["token"])
+            generated.append(token_id)
+            piece = tokenizer.decode(
+                [token_id], skip_special_tokens=False
+            )
+            logit_seconds = time.monotonic() - t0
+            report = {
+                "index": index,
+                "position": engine.position,
+                "token": token_id,
+                "piece": piece,
+                "top5": top5,
+                "logit_seconds": logit_seconds,
+            }
+            token_reports.append(report)
+            print(json.dumps({
+                "phase": "decode",
+                **report,
+            }, ensure_ascii=False), flush=True)
+
+            if token_id in EOS_IDS:
+                break
+            if index + 1 < max_new_tokens:
+                t1 = time.monotonic()
+                hidden = engine.step(token_id)
+                decode_seconds.append(time.monotonic() - t1)
+
+        generated_text = tokenizer.decode(
+            generated, skip_special_tokens=False
+        )
+        expected = "Hello from Bonsai 2!"
+        exact_text_match = generated_text.strip() == expected
+        result = {
+            "schema": "qwen38-bonsai2-real-prompt-spike-v1",
+            "status": "PASS" if generated else "FAIL",
+            "lab_only": True,
+            "model_sha256": base.MODEL_SHA256,
+            "prompt": prompt,
+            "rendered_prompt": rendered,
+            "prompt_token_count": len(prompt_ids),
+            "prompt_token_ids": prompt_ids,
+            "generated_token_ids": generated,
+            "generated_text": generated_text,
+            "expected_text": expected,
+            "exact_text_match": exact_text_match,
+            "token_reports": token_reports,
+            "stop_reason": (
+                "eos"
+                if generated and generated[-1] in EOS_IDS
+                else "max_new_tokens"
+            ),
+            "threads": threads,
+            "timing": {
+                "prefill_total_seconds": sum(prefill_seconds),
+                "prefill_mean_seconds_per_token": (
+                    sum(prefill_seconds) / len(prefill_seconds)
+                ),
+                "decode_step_total_seconds_excluding_logits": sum(decode_seconds),
+                "elapsed_seconds": time.monotonic() - started,
+            },
+            "state": engine.report(),
+            "max_rss_gib": t2.rss_gib(),
+        }
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps({
+            "status": result["status"],
+            "prompt_token_count": result["prompt_token_count"],
+            "generated_token_ids": result["generated_token_ids"],
+            "generated_text": generated_text,
+            "expected_text": expected,
+            "exact_text_match": exact_text_match,
+            "stop_reason": result["stop_reason"],
+            "timing": result["timing"],
+            "state": result["state"],
+            "max_rss_gib": result["max_rss_gib"],
+        }, indent=2, ensure_ascii=False))
+        if not generated:
+            raise SystemExit(1)
+        print("QWEN38_BONSAI2_REAL_PROMPT_SPIKE_PASS")
+        return result
+    finally:
+        engine.close()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", type=Path, required=True)
+    ap.add_argument("--native-lib", type=Path, required=True)
+    ap.add_argument("--state-lib", type=Path, required=True)
+    ap.add_argument("--tokenizer-json", type=Path, required=True)
+    ap.add_argument("--prompt", required=True)
+    ap.add_argument("--max-new-tokens", type=int, default=12)
+    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--work-dir", type=Path, required=True)
+    ap.add_argument("--output", type=Path, required=True)
+    args = ap.parse_args()
+    run(
+        args.model,
+        args.native_lib,
+        args.state_lib,
+        args.tokenizer_json,
+        args.prompt,
+        args.max_new_tokens,
+        args.work_dir,
+        args.output,
+        args.threads,
+    )
+
+
+if __name__ == "__main__":
+    main()
