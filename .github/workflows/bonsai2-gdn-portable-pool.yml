@@ -1,0 +1,43 @@
+name: Bonsai 2 GDN portable pool smoke
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/gdn_state_ar_portable_pool.c
+      - qwen38/gdn_state_ar.c
+      - qwen38/qwen_thread_compat.h
+      - .github/workflows/bonsai2-gdn-portable-pool.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run portable GDN pool
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gcc -O3 -std=c11 \
+            -DQWEN_GDN_PORTABLE_POOL_SELFTEST \
+            qwen38/gdn_state_ar_portable_pool.c \
+            -pthread -lm -o gdn-portable-pool
+          ./gdn-portable-pool
+
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Compile and run Win32 portable GDN pool
+        shell: cmd
+        run: |
+          cl /nologo /O2 /std:c11 /DQWEN_GDN_PORTABLE_POOL_SELFTEST qwen38\gdn_state_ar_portable_pool.c /Fe:gdn-portable-pool.exe
+          gdn-portable-pool.exe
