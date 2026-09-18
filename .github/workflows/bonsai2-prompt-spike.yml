@@ -1,4 +1,4 @@
-name: Bonsai 2 real prompt spike
+name: Bonsai 2 resident prompt A-B
 
 on:
   push:
@@ -91,6 +91,7 @@ jobs:
             --prompt "$PROMPT" \
             --max-new-tokens 12 \
             --threads 4 \
+            --resident-decoder \
             --work-dir work/bonsai2-prompt/k3 \
             --output work/bonsai2-prompt/prompt-result.json \
             > work/bonsai2-prompt/prompt.stdout.txt \
@@ -110,7 +111,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bonsai2-real-prompt-spike
+          name: bonsai2-real-prompt-resident
           path: |
             work/bonsai2-prompt/*.json
             work/bonsai2-prompt/*.txt
