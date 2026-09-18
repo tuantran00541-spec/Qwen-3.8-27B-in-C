@@ -12,7 +12,7 @@ on:
       - qwen38/bonsai2_persistent_pool_portable.c
       - qwen38/gdn_state_ar.c
       - qwen38/gdn_state_head_parallel.c
-      - qwen38/gdn_state_ar_4t.c
+      - qwen38/gdn_state_ar_portable_pool.c
       - qwen38/llama_full64_two_token_oracle.cpp
       - .github/workflows/bonsai2-two-token.yml
   workflow_dispatch:
@@ -47,7 +47,7 @@ jobs:
             -pthread -lm \
             -o work/bonsai2-two-token/libbonsai2_quant.so
           gcc -O3 -std=c11 -fPIC -shared \
-            qwen38/gdn_state_ar_4t.c \
+            qwen38/gdn_state_ar_portable_pool.c \
             -pthread -lm \
             -o work/bonsai2-two-token/libgdn_state.so
           python -m py_compile \
