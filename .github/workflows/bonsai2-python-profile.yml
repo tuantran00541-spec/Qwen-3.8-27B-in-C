@@ -1,6 +1,11 @@
 name: Bonsai 2 Python stateful profile
 
 on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - .github/workflows/bonsai2-python-profile.yml
   workflow_dispatch:
 
 permissions:
