@@ -1,4 +1,4 @@
-name: Bonsai 2 Linux full benchmark
+name: Bonsai 2 Linux quick benchmark
 
 on:
   push:
@@ -14,7 +14,7 @@ permissions:
 jobs:
   linux-cpu-reference:
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -57,7 +57,7 @@ jobs:
           echo "BENCH=$BENCH" >> "$GITHUB_ENV"
           "$BENCH" --version 2>&1 | tee work/bonsai2-linux/llama-version.txt || true
 
-      - name: Run PTQ1_0 full CPU sweep
+      - name: Run PTQ1_0 quick CPU sweep
         shell: bash
         run: |
           set -euxo pipefail
@@ -70,21 +70,21 @@ jobs:
           mv "$MODEL.part" "$MODEL"
 
           NPROC="$(nproc)"
-          THREADS="$(printf '%s\n' 1 2 "$NPROC" | awk '$1>0' | sort -nu | tr '\n' ' ')"
+          THREADS="$(printf '%s\n' 2 "$NPROC" | awk '$1>0' | sort -nu | tr '\n' ' ')"
           echo "PTQ1_0 thread sweep: $THREADS" | tee work/bonsai2-linux/ptq1-summary.txt
 
-          /usr/bin/time -v "$BENCH" -m "$MODEL" -ngl 0 -fa 1 -t "$NPROC" -p 16 -n 4 -r 1             > work/bonsai2-linux/ptq1-warmup.stdout.txt             2> work/bonsai2-linux/ptq1-warmup.stderr.txt
+          /usr/bin/time -v "$BENCH" -m "$MODEL" -ngl 0 -fa 1 -t "$NPROC" -p 8 -n 2 -r 1             > work/bonsai2-linux/ptq1-warmup.stdout.txt             2> work/bonsai2-linux/ptq1-warmup.stderr.txt
 
           for T in $THREADS; do
             echo "=== PTQ1_0 threads=$T ===" | tee -a work/bonsai2-linux/ptq1-summary.txt
-            /usr/bin/time -v "$BENCH" -m "$MODEL" -ngl 0 -fa 1 -t "$T" -p 512 -n 128 -r 2               > "work/bonsai2-linux/ptq1-t${T}.stdout.txt"               2> "work/bonsai2-linux/ptq1-t${T}.stderr.txt"
+            /usr/bin/time -v "$BENCH" -m "$MODEL" -ngl 0 -fa 1 -t "$T" --no-warmup -p 32 -n 8 -r 1               > "work/bonsai2-linux/ptq1-t${T}.stdout.txt"               2> "work/bonsai2-linux/ptq1-t${T}.stderr.txt"
             cat "work/bonsai2-linux/ptq1-t${T}.stdout.txt" | tee -a work/bonsai2-linux/ptq1-summary.txt
             grep -E 'Maximum resident set size|Elapsed \(wall clock\) time|User time|System time'               "work/bonsai2-linux/ptq1-t${T}.stderr.txt" | tee -a work/bonsai2-linux/ptq1-summary.txt || true
           done
 
           rm -f "$MODEL"
 
-      - name: Run PQ2_0 full CPU sweep
+      - name: Run PQ2_0 quick CPU sweep
         shell: bash
         run: |
           set -euxo pipefail
@@ -100,11 +100,11 @@ jobs:
           THREADS="$(printf '%s\n' 1 2 "$NPROC" | awk '$1>0' | sort -nu | tr '\n' ' ')"
           echo "PQ2_0 thread sweep: $THREADS" | tee work/bonsai2-linux/pq2-summary.txt
 
-          /usr/bin/time -v "$BENCH" -m "$MODEL" -ngl 0 -fa 1 -t "$NPROC" -p 16 -n 4 -r 1             > work/bonsai2-linux/pq2-warmup.stdout.txt             2> work/bonsai2-linux/pq2-warmup.stderr.txt
+          /usr/bin/time -v "$BENCH" -m "$MODEL" -ngl 0 -fa 1 -t "$NPROC" -p 8 -n 2 -r 1             > work/bonsai2-linux/pq2-warmup.stdout.txt             2> work/bonsai2-linux/pq2-warmup.stderr.txt
 
           for T in $THREADS; do
             echo "=== PQ2_0 threads=$T ===" | tee -a work/bonsai2-linux/pq2-summary.txt
-            /usr/bin/time -v "$BENCH" -m "$MODEL" -ngl 0 -fa 1 -t "$T" -p 512 -n 128 -r 2               > "work/bonsai2-linux/pq2-t${T}.stdout.txt"               2> "work/bonsai2-linux/pq2-t${T}.stderr.txt"
+            /usr/bin/time -v "$BENCH" -m "$MODEL" -ngl 0 -fa 1 -t "$T" --no-warmup -p 32 -n 8 -r 1               > "work/bonsai2-linux/pq2-t${T}.stdout.txt"               2> "work/bonsai2-linux/pq2-t${T}.stderr.txt"
             cat "work/bonsai2-linux/pq2-t${T}.stdout.txt" | tee -a work/bonsai2-linux/pq2-summary.txt
             grep -E 'Maximum resident set size|Elapsed \(wall clock\) time|User time|System time'               "work/bonsai2-linux/pq2-t${T}.stderr.txt" | tee -a work/bonsai2-linux/pq2-summary.txt || true
           done
@@ -113,7 +113,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bonsai2-linux-full-benchmark
+          name: bonsai2-linux-quick-benchmark
           path: work/bonsai2-linux/
           if-no-files-found: error
           retention-days: 30
