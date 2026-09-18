@@ -89,6 +89,28 @@ class Bonsai2NativeRuntime:
         ]
         self.lib.qwen_bonsai2_fwht_blocks.restype = ctypes.c_int
 
+        self.lib.qwen_bonsai2_inverse_fwht_blocks.argtypes = [
+            _C_FP, ctypes.c_size_t, ctypes.c_size_t, _C_I8P
+        ]
+        self.lib.qwen_bonsai2_inverse_fwht_blocks.restype = ctypes.c_int
+        self.lib.qwen_bonsai2_permute_gdn_ssm_out_f32.argtypes = [
+            _C_FP, _C_FP, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_size_t, ctypes.c_size_t
+        ]
+        self.lib.qwen_bonsai2_permute_gdn_ssm_out_f32.restype = ctypes.c_int
+        self.lib.qwen_bonsai2_matvec_bf16_f32.argtypes = [
+            _C_U8P, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+            _C_FP, _C_FP
+        ]
+        self.lib.qwen_bonsai2_matvec_bf16_f32.restype = ctypes.c_int
+        for name in (
+            "qwen_bonsai2_dequantize_ptq1_0_row",
+            "qwen_bonsai2_dequantize_pq2_0_row",
+        ):
+            fn = getattr(self.lib, name)
+            fn.argtypes = [_C_U8P, ctypes.c_size_t, ctypes.c_size_t, _C_FP]
+            fn.restype = ctypes.c_int
+
         if hasattr(self.lib, "qwen_bonsai2_pool_create"):
             self.lib.qwen_bonsai2_pool_create.argtypes = [
                 ctypes.c_int, ctypes.c_size_t
@@ -170,14 +192,20 @@ class Bonsai2NativeRuntime:
             return arr
 
         if self.gdn_v_grouped and ".ssm_out." in weight_name:
-            raise NotImplementedError(
-                "GDN ssm_out requires the Prism tiled->grouped head permutation "
-                "before Hadamard; the first native K3 gate deliberately excludes it"
+            if n % (48 * 128) != 0 or n != 48 * 128:
+                raise ValueError(f"{weight_name}: unexpected Qwen3.5 GDN width {n}")
+            grouped = (ctypes.c_float * n)()
+            rc = self.lib.qwen_bonsai2_permute_gdn_ssm_out_f32(
+                arr, grouped, n, 128, 16, 3
             )
+            if rc != 0:
+                raise RuntimeError(
+                    f"{weight_name}: native GDN grouped permutation failed rc={rc}"
+                )
+            arr = grouped
 
         sign_owner, sign_ptr = self._sign_array(n)
         rc = self.lib.qwen_bonsai2_fwht_blocks(arr, n, self.block_size, sign_ptr)
-        # Keep the ctypes sign array alive through the synchronous native call.
         _ = sign_owner
         if rc != 0:
             raise RuntimeError(f"{weight_name}: native Hadamard failed rc={rc}")
@@ -207,6 +235,20 @@ class Bonsai2NativeRuntime:
     ) -> list[float]:
         kind = str(meta["type_name"])
         ne0, rows = map(int, meta["shape"])
+        if kind == "BF16":
+            activation = prepared
+            if not isinstance(activation, ctypes.Array):
+                activation = (ctypes.c_float * ne0)(*map(float, activation))
+            w_arr = (ctypes.c_uint8 * len(weights)).from_buffer(weights)
+            out = (ctypes.c_float * rows)()
+            rc = self.lib.qwen_bonsai2_matvec_bf16_f32(
+                w_arr, len(weights), rows, ne0, activation, out
+            )
+            if rc != 0:
+                raise RuntimeError(f"{meta['name']}: native BF16 matvec failed rc={rc}")
+            self.matvec_rows += rows
+            return [float(out[i]) for i in range(rows)]
+
         activation, activation_bytes = prepared
         expected_activation_bytes = (ne0 // 32) * 34
         if activation_bytes != expected_activation_bytes:
@@ -255,8 +297,43 @@ class Bonsai2NativeRuntime:
         ne0 = int(meta["shape"][0])
         if len(x) != ne0:
             raise ValueError(f"{meta['name']}: input width={len(x)} ne0={ne0}")
-        prepared = self.prepare_activation(str(meta["name"]), x)
+        if str(meta["type_name"]) == "BF16":
+            prepared = (ctypes.c_float * ne0)(*map(float, x))
+        else:
+            prepared = self.prepare_activation(str(meta["name"]), x)
         return self.matvec_prepared(weights, meta, prepared)
+
+    def dequantize_lookup_row(
+        self,
+        raw: bytes | bytearray | memoryview,
+        kind: str,
+        n: int,
+        weight_name: str,
+    ) -> list[float]:
+        if kind == "PTQ1_0":
+            fn = self.lib.qwen_bonsai2_dequantize_ptq1_0_row
+        elif kind == "PQ2_0":
+            fn = self.lib.qwen_bonsai2_dequantize_pq2_0_row
+        else:
+            raise ValueError(f"unsupported Bonsai 2 lookup type {kind}")
+        buf = bytearray(raw)
+        src = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
+        out = (ctypes.c_float * n)()
+        rc = fn(src, len(buf), n, out)
+        if rc != 0:
+            raise RuntimeError(f"{weight_name}: dequantize row failed rc={rc}")
+
+        if weight_name in self.inverse_weights:
+            sign_owner, sign_ptr = self._sign_array(n)
+            rc = self.lib.qwen_bonsai2_inverse_fwht_blocks(
+                out, n, self.block_size, sign_ptr
+            )
+            _ = sign_owner
+            if rc != 0:
+                raise RuntimeError(
+                    f"{weight_name}: inverse Hadamard lookup failed rc={rc}"
+                )
+        return [float(out[i]) for i in range(n)]
 
     def report(self) -> dict[str, object]:
         return {
