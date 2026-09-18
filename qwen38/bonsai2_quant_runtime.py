@@ -9,6 +9,7 @@ wired only after these primitives pass real-weight gates.
 from __future__ import annotations
 
 import ctypes
+import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -174,6 +175,22 @@ class Bonsai2NativeRuntime:
         self.activation_quantizations = 0
         self.hadamard_transforms = 0
         self.matvec_rows = 0
+        timing_keys = (
+            "activation_pack",
+            "hadamard",
+            "q8_quantize",
+            "ptq1_matvec",
+            "pq2_matvec",
+            "bf16_matvec",
+            "lookup_dequantize",
+            "output_copy",
+        )
+        self.timing_seconds = {key: 0.0 for key in timing_keys}
+        self.timing_calls = {key: 0 for key in timing_keys}
+
+    def _record_timing(self, key: str, started: float) -> None:
+        self.timing_seconds[key] += time.perf_counter() - started
+        self.timing_calls[key] += 1
 
     def _sign_array(self, width: int):
         if self.sign_mode == "identity":
@@ -187,10 +204,13 @@ class Bonsai2NativeRuntime:
 
     def transform_activation(self, weight_name: str, x: Sequence[float]):
         n = len(x)
+        started = time.perf_counter()
         arr = (ctypes.c_float * n)(*map(float, x))
+        self._record_timing("activation_pack", started)
         if weight_name not in self.folded_weights:
             return arr
 
+        started = time.perf_counter()
         if self.gdn_v_grouped and ".ssm_out." in weight_name:
             if n % (48 * 128) != 0 or n != 48 * 128:
                 raise ValueError(f"{weight_name}: unexpected Qwen3.5 GDN width {n}")
@@ -210,6 +230,7 @@ class Bonsai2NativeRuntime:
         if rc != 0:
             raise RuntimeError(f"{weight_name}: native Hadamard failed rc={rc}")
         self.hadamard_transforms += 1
+        self._record_timing("hadamard", started)
         return arr
 
     def quantize_q8_0(self, arr, n: int):
@@ -217,7 +238,9 @@ class Bonsai2NativeRuntime:
             raise ValueError(f"Q8_0 activation width {n} is not divisible by 32")
         nbytes = (n // 32) * 34
         buf = (ctypes.c_uint8 * nbytes)()
+        started = time.perf_counter()
         rc = self.lib.qwen_quantize_q8_0_scalar(arr, n, buf, nbytes)
+        self._record_timing("q8_quantize", started)
         if rc != 0:
             raise RuntimeError(f"Q8_0 activation quantization failed rc={rc}")
         self.activation_quantizations += 1
@@ -241,13 +264,18 @@ class Bonsai2NativeRuntime:
                 activation = (ctypes.c_float * ne0)(*map(float, activation))
             w_arr = (ctypes.c_uint8 * len(weights)).from_buffer(weights)
             out = (ctypes.c_float * rows)()
+            started = time.perf_counter()
             rc = self.lib.qwen_bonsai2_matvec_bf16_f32(
                 w_arr, len(weights), rows, ne0, activation, out
             )
+            self._record_timing("bf16_matvec", started)
             if rc != 0:
                 raise RuntimeError(f"{meta['name']}: native BF16 matvec failed rc={rc}")
             self.matvec_rows += rows
-            return [float(out[i]) for i in range(rows)]
+            started = time.perf_counter()
+            result = [float(out[i]) for i in range(rows)]
+            self._record_timing("output_copy", started)
+            return result
 
         activation, activation_bytes = prepared
         expected_activation_bytes = (ne0 // 32) * 34
@@ -282,11 +310,17 @@ class Bonsai2NativeRuntime:
             activation_bytes,
             out,
         )
+        timing_key = "ptq1_matvec" if kind == "PTQ1_0" else "pq2_matvec"
+        started = time.perf_counter()
         rc = fn(self.pool, *common) if self.pool else fn(*common)
+        self._record_timing(timing_key, started)
         if rc != 0:
             raise RuntimeError(f"{meta['name']}: native Bonsai 2 matvec failed rc={rc}")
         self.matvec_rows += rows
-        return [float(out[i]) for i in range(rows)]
+        started = time.perf_counter()
+        result = [float(out[i]) for i in range(rows)]
+        self._record_timing("output_copy", started)
+        return result
 
     def matvec(
         self,
@@ -319,6 +353,7 @@ class Bonsai2NativeRuntime:
         buf = bytearray(raw)
         src = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
         out = (ctypes.c_float * n)()
+        started = time.perf_counter()
         rc = fn(src, len(buf), n, out)
         if rc != 0:
             raise RuntimeError(f"{weight_name}: dequantize row failed rc={rc}")
@@ -333,7 +368,11 @@ class Bonsai2NativeRuntime:
                 raise RuntimeError(
                     f"{weight_name}: inverse Hadamard lookup failed rc={rc}"
                 )
-        return [float(out[i]) for i in range(n)]
+        self._record_timing("lookup_dequantize", started)
+        started = time.perf_counter()
+        result = [float(out[i]) for i in range(n)]
+        self._record_timing("output_copy", started)
+        return result
 
     def report(self) -> dict[str, object]:
         return {
@@ -352,6 +391,8 @@ class Bonsai2NativeRuntime:
             "activation_quantizations": self.activation_quantizations,
             "hadamard_transforms": self.hadamard_transforms,
             "matvec_rows": self.matvec_rows,
+            "timing_seconds": dict(self.timing_seconds),
+            "timing_calls": dict(self.timing_calls),
         }
 
 
