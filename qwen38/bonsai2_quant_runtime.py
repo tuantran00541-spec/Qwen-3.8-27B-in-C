@@ -99,6 +99,10 @@ class Bonsai2NativeRuntime:
             ctypes.c_size_t, ctypes.c_size_t
         ]
         self.lib.qwen_bonsai2_permute_gdn_ssm_out_f32.restype = ctypes.c_int
+        self.lib.qwen_bonsai2_swiglu_f32.argtypes = [
+            _C_FP, _C_FP, ctypes.c_size_t, _C_FP
+        ]
+        self.lib.qwen_bonsai2_swiglu_f32.restype = ctypes.c_int
         self.lib.qwen_bonsai2_matvec_bf16_f32.argtypes = [
             _C_U8P, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
             _C_FP, _C_FP
@@ -183,6 +187,7 @@ class Bonsai2NativeRuntime:
             "pq2_matvec",
             "bf16_matvec",
             "lookup_dequantize",
+            "swiglu",
             "output_copy",
         )
         self.timing_seconds = {key: 0.0 for key in timing_keys}
@@ -249,6 +254,33 @@ class Bonsai2NativeRuntime:
     def prepare_activation(self, weight_name: str, x: Sequence[float]):
         arr = self.transform_activation(weight_name, x)
         return self.quantize_q8_0(arr, len(x))
+
+    def swiglu(
+        self,
+        gate: Sequence[float],
+        up: Sequence[float],
+    ) -> list[float]:
+        if len(gate) != len(up):
+            raise ValueError(
+                f"SwiGLU shape mismatch gate={len(gate)} up={len(up)}"
+            )
+        n = len(gate)
+        if n == 0:
+            return []
+        gate_arr = (ctypes.c_float * n)(*map(float, gate))
+        up_arr = (ctypes.c_float * n)(*map(float, up))
+        out = (ctypes.c_float * n)()
+        started = time.perf_counter()
+        rc = self.lib.qwen_bonsai2_swiglu_f32(
+            gate_arr, up_arr, n, out
+        )
+        self._record_timing("swiglu", started)
+        if rc != 0:
+            raise RuntimeError(f"native Bonsai 2 SwiGLU failed rc={rc}")
+        started = time.perf_counter()
+        result = [float(out[i]) for i in range(n)]
+        self._record_timing("output_copy", started)
+        return result
 
     def matvec_prepared(
         self,
