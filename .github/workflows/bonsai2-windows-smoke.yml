@@ -1,0 +1,79 @@
+name: Bonsai 2 Windows smoke
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/gguf_stream.py
+      - scripts/setup_bonsai2.ps1
+      - scripts/bench_bonsai2.ps1
+      - scripts/bonsai2_inventory.py
+      - docs/BONSAI2_TEST.md
+      - .github/workflows/bonsai2-windows-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bonsai2-ptq1-cpu-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Parse experiment PowerShell
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(
+            'scripts\setup_bonsai2.ps1',
+            'scripts\bench_bonsai2.ps1'
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "${file}: $($_.Message)" }
+              throw "PowerShell parse failed for $file"
+            }
+          }
+          Write-Host 'BONSAI2_POWERSHELL_PARSE_PASS'
+
+      - name: Compile Python probes
+        shell: pwsh
+        run: |
+          python -m py_compile qwen38\gguf_stream.py scripts\bonsai2_inventory.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download pinned Prism CPU runtime and PTQ1_0 model
+        shell: pwsh
+        run: .\scripts\setup_bonsai2.ps1 -Quant PTQ1_0
+
+      - name: Inventory Bonsai 2 GGUF through project parser
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path work\bonsai2 | Out-Null
+          python scripts\bonsai2_inventory.py --model models\bonsai2\Ternary-Bonsai-2-27B-PTQ1_0.gguf --output work\bonsai2\ptq1-inventory.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run small CPU reference benchmark
+        shell: pwsh
+        run: .\scripts\bench_bonsai2.ps1 -Quant PTQ1_0 -Threads 2 -PromptTokens 32 -GenTokens 8 -Repetitions 1
+
+      - name: Upload experiment evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai2-windows-smoke
+          path: |
+            work/bonsai2/*.json
+            work/bonsai2/*.txt
+          if-no-files-found: warn
