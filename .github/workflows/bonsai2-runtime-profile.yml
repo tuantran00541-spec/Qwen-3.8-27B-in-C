@@ -1,0 +1,47 @@
+name: Bonsai 2 runtime profile gate
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/test_bonsai2_runtime_profile.py
+      - qwen38/bonsai2_quant_runtime.py
+      - qwen38/bonsai2_two_token.py
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - qwen38/bonsai2_persistent_pool_portable.c
+      - qwen38/gdn_state_ar_portable_pool.c
+      - .github/workflows/bonsai2-runtime-profile.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build native libraries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/profile
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared \
+            qwen38/bonsai2_persistent_pool_portable.c \
+            -pthread -lm \
+            -o work/profile/libbonsai2_quant.so
+          gcc -O3 -std=c11 -fPIC -shared \
+            qwen38/gdn_state_ar_portable_pool.c \
+            -pthread -lm \
+            -o work/profile/libgdn_state.so
+      - name: Run timing profile contract
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python qwen38/test_bonsai2_runtime_profile.py \
+            --quant-lib work/profile/libbonsai2_quant.so \
+            --state-lib work/profile/libgdn_state.so
