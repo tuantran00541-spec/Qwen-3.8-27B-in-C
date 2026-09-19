@@ -170,8 +170,12 @@ def recurrent_step(runtime, state_lib, state, prev_qkv, view, metas, vec,
     q = conv[:gdn.KEY_DIM]; k = conv[gdn.KEY_DIM:2*gdn.KEY_DIM]; v = conv[2*gdn.KEY_DIM:]
     qn = gdn.flatten([gdn.l2_norm(h) for h in gdn.split_heads(q, gdn.K_HEADS)])
     kn = gdn.flatten([gdn.l2_norm(h) for h in gdn.split_heads(k, gdn.K_HEADS)])
-    q48 = [mulf(vv, SCALE_GDN) for vv in repeat_k_heads(qn)]
-    k48 = repeat_k_heads(kn)
+    q48, k48 = runtime.gdn_repeat_scale(
+        qn,
+        kn,
+        repeats=gdn.V_HEADS // gdn.K_HEADS,
+        scale=SCALE_GDN,
+    )
 
     out_buf = (ctypes.c_float * gdn.VALUE_DIM)()
     rc = state_lib.step(

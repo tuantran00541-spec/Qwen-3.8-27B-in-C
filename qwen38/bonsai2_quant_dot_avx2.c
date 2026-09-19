@@ -20,6 +20,7 @@
 
 #include "gguf_quant_dot_avx2.c"
 #include "attention_core_exact.c"
+#include "gdn_repeat_scale_exact.c"
 
 #define QWEN_QK_PQ2_0 128
 #define QWEN_BLOCK_PQ2_0 34
@@ -49,6 +50,18 @@ QWEN_EXPORT int qwen_bonsai2_attention_core_f32(
     return qwen_attention_core_f32_exact(
         q, q_heads, kv_heads, head_dim,
         k_cache, v_cache, n_ctx, scale, out);
+}
+
+QWEN_EXPORT int qwen_bonsai2_gdn_repeat_scale_f32(
+        const float *q,
+        const float *k,
+        size_t key_dim,
+        size_t repeats,
+        float scale,
+        float *q_out,
+        float *k_out) {
+    return qwen38_gdn_repeat_scale_many_exact_f32(
+        q, k, 1, key_dim, repeats, scale, q_out, k_out);
 }
 
 QWEN_EXPORT int qwen_bonsai2_swiglu_f32(

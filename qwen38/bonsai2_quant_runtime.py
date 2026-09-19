@@ -113,6 +113,11 @@ class Bonsai2NativeRuntime:
             _C_FP, _C_FP, ctypes.c_size_t, _C_FP
         ]
         self.lib.qwen_bonsai2_residual_add_f32.restype = ctypes.c_int
+        self.lib.qwen_bonsai2_gdn_repeat_scale_f32.argtypes = [
+            _C_FP, _C_FP, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_float, _C_FP, _C_FP
+        ]
+        self.lib.qwen_bonsai2_gdn_repeat_scale_f32.restype = ctypes.c_int
         self.lib.qwen_bonsai2_attention_core_f32.argtypes = [
             _C_FP,
             ctypes.c_size_t,
@@ -228,6 +233,7 @@ class Bonsai2NativeRuntime:
             "attention_core",
             "residual_add",
             "gdn_conv_silu",
+            "gdn_repeat_scale",
             "gdn_norm_gate",
             "rms_norm",
             "output_copy",
@@ -445,6 +451,46 @@ class Bonsai2NativeRuntime:
 
         started = time.perf_counter()
         result = [float(out[i]) for i in range(q_dim)]
+        self._record_timing("output_copy", started)
+        return result
+
+    def gdn_repeat_scale(
+        self,
+        q: Sequence[float],
+        k: Sequence[float],
+        *,
+        repeats: int,
+        scale: float,
+    ) -> tuple[list[float], list[float]]:
+        key_dim = len(q)
+        repeats = int(repeats)
+        if key_dim == 0 or len(k) != key_dim or repeats <= 0:
+            raise ValueError(
+                f"GDN repeat-scale shape mismatch q={len(q)} k={len(k)} "
+                f"repeats={repeats}"
+            )
+        q_arr = array("f", map(float, q))
+        k_arr = array("f", map(float, k))
+        out_width = key_dim * repeats
+        q_out = array("f", [0.0]) * out_width
+        k_out = array("f", [0.0]) * out_width
+
+        started = time.perf_counter()
+        rc = self.lib.qwen_bonsai2_gdn_repeat_scale_f32(
+            self._array_f32_ptr(q_arr),
+            self._array_f32_ptr(k_arr),
+            key_dim,
+            repeats,
+            ctypes.c_float(float(scale)),
+            self._array_f32_ptr(q_out),
+            self._array_f32_ptr(k_out),
+        )
+        self._record_timing("gdn_repeat_scale", started)
+        if rc != 0:
+            raise RuntimeError(f"native GDN repeat-scale failed rc={rc}")
+
+        started = time.perf_counter()
+        result = (q_out.tolist(), k_out.tolist())
         self._record_timing("output_copy", started)
         return result
 

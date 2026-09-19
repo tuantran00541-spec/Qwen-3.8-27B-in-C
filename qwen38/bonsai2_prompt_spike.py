@@ -160,8 +160,12 @@ def recurrent_step(
     kn = gdn.flatten([
         gdn.l2_norm(head) for head in gdn.split_heads(k, gdn.K_HEADS)
     ])
-    q48 = [mulf(value, t2.SCALE_GDN) for value in t2.repeat_k_heads(qn)]
-    k48 = t2.repeat_k_heads(kn)
+    q48, k48 = runtime.gdn_repeat_scale(
+        qn,
+        kn,
+        repeats=gdn.V_HEADS // gdn.K_HEADS,
+        scale=t2.SCALE_GDN,
+    )
 
     out_buf = (t2.ctypes.c_float * gdn.VALUE_DIM)()
     rc = state_lib.step(
