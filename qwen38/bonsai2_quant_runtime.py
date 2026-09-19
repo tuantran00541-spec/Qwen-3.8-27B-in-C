@@ -112,6 +112,11 @@ class Bonsai2NativeRuntime:
             ctypes.c_float, _C_FP
         ]
         self.lib.qwen_bonsai2_gdn_norm_gate_f32.restype = ctypes.c_int
+        self.lib.qwen_bonsai2_rms_norm_f32.argtypes = [
+            _C_FP, _C_FP, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_float, _C_FP
+        ]
+        self.lib.qwen_bonsai2_rms_norm_f32.restype = ctypes.c_int
         self.lib.qwen_bonsai2_matvec_bf16_f32.argtypes = [
             _C_U8P, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
             _C_FP, _C_FP
@@ -199,6 +204,7 @@ class Bonsai2NativeRuntime:
             "swiglu",
             "gdn_conv_silu",
             "gdn_norm_gate",
+            "rms_norm",
             "output_copy",
         )
         self.timing_seconds = {key: 0.0 for key in timing_keys}
@@ -382,6 +388,35 @@ class Bonsai2NativeRuntime:
         if rc != 0:
             raise RuntimeError(f"native GDN norm+gate failed rc={rc}")
 
+        started = time.perf_counter()
+        result = [float(out[i]) for i in range(n)]
+        self._record_timing("output_copy", started)
+        return result
+
+    def rms_norm(
+        self,
+        values: Sequence[float],
+        weight: Sequence[float],
+        *,
+        rows: int = 1,
+        eps: float = 1e-6,
+    ) -> list[float]:
+        n = len(values)
+        width = len(weight)
+        if rows < 1 or width < 1 or n != rows * width:
+            raise ValueError(
+                f"RMSNorm shape mismatch values={n} rows={rows} width={width}"
+            )
+        x_arr = (ctypes.c_float * n)(*map(float, values))
+        w_arr = (ctypes.c_float * width)(*map(float, weight))
+        out = (ctypes.c_float * n)()
+        started = time.perf_counter()
+        rc = self.lib.qwen_bonsai2_rms_norm_f32(
+            x_arr, w_arr, rows, width, ctypes.c_float(float(eps)), out
+        )
+        self._record_timing("rms_norm", started)
+        if rc != 0:
+            raise RuntimeError(f"native RMSNorm failed rc={rc}")
         started = time.perf_counter()
         result = [float(out[i]) for i in range(n)]
         self._record_timing("output_copy", started)
