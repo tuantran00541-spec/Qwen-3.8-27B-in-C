@@ -1050,6 +1050,98 @@ static int qwen_bonsai2_matvec_ptq1_0_q8_0_cached_scales(
     return 0;
 }
 
+
+QWEN_EXPORT int qwen_bonsai2_matvec_many_ptq1_0_q8_0(
+        const uint8_t *weights,
+        size_t weights_bytes,
+        size_t rows,
+        size_t n,
+        const uint8_t *activations,
+        size_t activation_bytes_each,
+        size_t n_vec,
+        float *out) {
+    if (!weights || !activations || !out ||
+        rows == 0 || n == 0 || n_vec == 0 ||
+        n % QWEN_QK_PTQ1_0 != 0) {
+        return -1;
+    }
+
+    const size_t weight_blocks = n / QWEN_QK_PTQ1_0;
+    const size_t row_bytes = weight_blocks * QWEN_BLOCK_PTQ1_0;
+    const size_t q8_blocks = n / QWEN_QK8_0;
+    const size_t activation_bytes =
+        q8_blocks * QWEN_BLOCK_Q8_0;
+    if (weights_bytes != rows * row_bytes) return -2;
+    if (activation_bytes_each != activation_bytes) return -3;
+
+    float *activation_scales = (float *)malloc(
+        n_vec * q8_blocks * sizeof(float));
+    float *sums = (float *)malloc(n_vec * sizeof(float));
+    if (!activation_scales || !sums) {
+        free(sums);
+        free(activation_scales);
+        return -4;
+    }
+
+    for (size_t v = 0; v < n_vec; ++v) {
+        const uint8_t *activation =
+            activations + v * activation_bytes_each;
+        float *scales = activation_scales + v * q8_blocks;
+        for (size_t ib = 0; ib < q8_blocks; ++ib) {
+            const uint8_t *ab =
+                activation + ib * QWEN_BLOCK_Q8_0;
+            scales[ib] =
+                qwen_f16_to_f32(qwen_load_u16_le(ab));
+        }
+    }
+
+    int8_t lut[256][5];
+    int8_t q[QWEN_QK_PTQ1_0];
+    qwen_bonsai2_ptq1_lut(lut);
+
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t v = 0; v < n_vec; ++v) sums[v] = 0.0f;
+        const uint8_t *wrow = weights + r * row_bytes;
+
+        for (size_t ib = 0; ib < weight_blocks; ++ib) {
+            const uint8_t *xb =
+                wrow + ib * QWEN_BLOCK_PTQ1_0;
+            qwen_bonsai2_decode_ptq1_block(xb, lut, q);
+            const float d0 =
+                qwen_f16_to_f32(qwen_load_u16_le(xb + 26));
+
+            for (size_t v = 0; v < n_vec; ++v) {
+                const uint8_t *yb =
+                    activations + v * activation_bytes_each +
+                    ib * 4 * QWEN_BLOCK_Q8_0;
+                const float *scales =
+                    activation_scales + v * q8_blocks +
+                    ib * 4;
+
+                float sumi = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    const uint8_t *ab =
+                        yb + k * QWEN_BLOCK_Q8_0;
+                    const int32_t dot =
+                        qwen_bonsai2_dot_i8_32_avx2(
+                            q + k * 32,
+                            (const int8_t *)(ab + 2));
+                    sumi += scales[k] * (float)dot;
+                }
+                sums[v] += d0 * sumi;
+            }
+        }
+
+        for (size_t v = 0; v < n_vec; ++v) {
+            out[v * rows + r] = sums[v];
+        }
+    }
+
+    free(sums);
+    free(activation_scales);
+    return 0;
+}
+
 int qwen_bonsai2_matvec_pq2_0_q8_0(
         const uint8_t *weights, size_t weights_bytes, size_t rows, size_t n,
         const uint8_t *activation, size_t activation_bytes, float *out) {
