@@ -18,6 +18,7 @@ class ProbeRuntime:
         self.ssm_out_input = None
         self.rms_norm_calls = 0
         self.residual_add_calls = 0
+        self.gdn_repeat_scale_calls = 0
 
     def rms_norm(self, values, weight, *, rows=1, eps=1e-6):
         self.rms_norm_calls += 1
@@ -29,6 +30,18 @@ class ProbeRuntime:
             start = row * width
             out.extend(gdn.rms_norm(values[start:start + width], weight, eps))
         return out
+
+    def gdn_repeat_scale(self, q, k, *, repeats, scale):
+        self.gdn_repeat_scale_calls += 1
+        assert len(q) == gdn.KEY_DIM
+        assert len(k) == gdn.KEY_DIM
+        assert repeats == gdn.V_HEADS // gdn.K_HEADS
+        q_out = []
+        k_out = []
+        for _ in range(repeats):
+            q_out.extend(t2.mulf(v, scale) for v in q)
+            k_out.extend(float(v) for v in k)
+        return q_out, k_out
 
     def residual_add(self, a, b):
         self.residual_add_calls += 1
@@ -151,6 +164,10 @@ def main() -> None:
     assert runtime.residual_add_calls == 2, (
         "recurrent_step must delegate both residual adds to native runtime, "
         f"calls={runtime.residual_add_calls}"
+    )
+    assert runtime.gdn_repeat_scale_calls == 1, (
+        "recurrent_step must delegate GDN q/k repeat-scale exactly once, "
+        f"calls={runtime.gdn_repeat_scale_calls}"
     )
     assert runtime.ssm_out_input == [0.125] * gdn.VALUE_DIM, (
         "ssm_out must consume native norm+gate output"
