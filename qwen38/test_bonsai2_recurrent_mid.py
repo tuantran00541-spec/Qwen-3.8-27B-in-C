@@ -129,7 +129,7 @@ def main() -> None:
     fn.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p, FP,
         FP, FP, FP, FP, ctypes.c_size_t,
-        FP, FP, FP, FP, FP, FP,
+        FP, FP, FP, FP, FP, FP, FP,
         ctypes.c_float, ctypes.c_float, FP,
     ]
     fn.restype = ctypes.c_int
