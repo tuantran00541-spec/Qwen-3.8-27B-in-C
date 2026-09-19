@@ -101,6 +101,38 @@ QWEN_EXPORT int qwen_bonsai2_gdn_conv_silu_f32(
     return 0;
 }
 
+QWEN_EXPORT int qwen_bonsai2_rms_norm_f32(
+        const float *x,
+        const float *weight,
+        size_t rows,
+        size_t width,
+        float eps,
+        float *out) {
+    if (!x || !weight || !out || rows == 0 || width == 0) return -1;
+
+    for (size_t row = 0; row < rows; ++row) {
+        const size_t base = row * width;
+        double sum_sq = 0.0;
+        for (size_t i = 0; i < width; ++i) {
+            const float v = x[base + i];
+            const float sq = qwen_bonsai2_round_mul_f32(v, v);
+            sum_sq += (double)sq;
+        }
+        const float mean = (float)(sum_sq / (double)width);
+        const float mean_eps = qwen_bonsai2_round_add_f32(mean, eps);
+        const float root = sqrtf(mean_eps);
+        const float scale = qwen_bonsai2_round_div_f32(1.0f, root);
+
+        for (size_t i = 0; i < width; ++i) {
+            const float scaled = qwen_bonsai2_round_mul_f32(
+                x[base + i], scale);
+            out[base + i] = qwen_bonsai2_round_mul_f32(
+                scaled, weight[i]);
+        }
+    }
+    return 0;
+}
+
 QWEN_EXPORT int qwen_bonsai2_gdn_norm_gate_f32(
         const float *core,
         const float *norm_weight,
