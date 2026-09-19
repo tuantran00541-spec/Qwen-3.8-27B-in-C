@@ -1,0 +1,29 @@
+name: Bonsai 2 decode profile contract
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/test_bonsai2_decode_profile.py
+      - qwen38/bonsai2_prompt_spike.py
+      - .github/workflows/bonsai2-decode-profile.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  decode-profile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify decode profile delta contract
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python qwen38/test_bonsai2_decode_profile.py
+          python -m py_compile qwen38/bonsai2_prompt_spike.py
