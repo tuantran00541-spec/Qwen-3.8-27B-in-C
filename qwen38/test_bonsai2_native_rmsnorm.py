@@ -65,12 +65,36 @@ def check(rt: Bonsai2NativeRuntime, rows: int, width: int, seed: int) -> None:
             )
 
 
+
+def check_execution_wiring() -> None:
+    targets = {
+        "bonsai2_full64_one_token.py": 8,
+        "bonsai2_two_token.py": 7,
+        "bonsai2_prompt_spike.py": 7,
+    }
+    forbidden = ("gdn.rms_norm(", "attn.rms_norm_heads(")
+    for filename, min_native_calls in targets.items():
+        source = (ROOT / "qwen38" / filename).read_text(encoding="utf-8")
+        leftovers = [needle for needle in forbidden if needle in source]
+        if leftovers:
+            raise AssertionError(
+                f"{filename}: Python RMSNorm still wired in hot path: {leftovers}"
+            )
+        native_calls = source.count("runtime.rms_norm(")
+        if native_calls < min_native_calls:
+            raise AssertionError(
+                f"{filename}: native RMSNorm call sites={native_calls} "
+                f"expected>={min_native_calls}"
+            )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--native-lib", type=Path, required=True)
     args = ap.parse_args()
 
     exact.install()
+    check_execution_wiring()
     rt = Bonsai2NativeRuntime(args.native_lib, metadata(), threads=1, max_rows=4)
     try:
         assert hasattr(rt, "rms_norm"), "missing native exact-F32 RMSNorm API"
