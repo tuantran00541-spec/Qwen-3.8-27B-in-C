@@ -1,0 +1,35 @@
+name: Bonsai 2 PTQ1 decode reuse
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/test_bonsai2_ptq1_decode_reuse.c
+      - qwen38/test_bonsai2_ptq1_decode_reuse_wiring.py
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - .github/workflows/bonsai2-ptq1-decode-reuse.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ptq1-decode-reuse:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile PTQ1 decode-reuse gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gcc -O3 -std=c11 -mavx2 -mfma \
+            -Werror=implicit-function-declaration \
+            qwen38/test_bonsai2_ptq1_decode_reuse.c -pthread -lm \
+            -o bonsai2-ptq1-decode-reuse
+      - name: Run PTQ1 decode-reuse bitwise gate and microbenchmark
+        shell: bash
+        run: ./bonsai2-ptq1-decode-reuse
+      - name: Require production PTQ1 decode-reuse wiring
+        shell: bash
+        run: python qwen38/test_bonsai2_ptq1_decode_reuse_wiring.py
