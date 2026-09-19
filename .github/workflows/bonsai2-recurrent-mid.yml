@@ -8,6 +8,7 @@ on:
       - qwen38/test_bonsai2_recurrent_mid.py
       - qwen38/bonsai2_quant_dot_avx2.c
       - qwen38/bonsai2_persistent_pool_portable.c
+      - qwen38/bonsai2_quant_runtime.py
       - .github/workflows/bonsai2-recurrent-mid.yml
   workflow_dispatch:
 

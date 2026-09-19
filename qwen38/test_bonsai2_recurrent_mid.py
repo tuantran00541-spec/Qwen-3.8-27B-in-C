@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "qwen38"))
 import bonsai2_two_token as t2
 import qwen35_gdn_quant_layer_gate as gdn
 import qwen35_k3_full64_ggml_exact as exact
+from bonsai2_quant_runtime import Bonsai2NativeRuntime
 
 KEY_DIM = gdn.KEY_DIM
 VALUE_DIM = gdn.VALUE_DIM
@@ -115,6 +116,95 @@ def reference_prepare(qkv: array, history: list[array], kernels: array,
     return q48, k48, array("f", v), gate, beta
 
 
+
+class FakeStateLib:
+    class Lib:
+        qwen_gdn_pool_step_f32 = fake_state_step
+
+    lib = Lib()
+    pool = None
+
+
+def verify_runtime_wrapper(lib_path: str) -> None:
+    metadata = {
+        "prism.hadamard.version": 1,
+        "prism.hadamard.block_size": 1024,
+        "prism.hadamard.transform": "normalized-sylvester-walsh-hadamard",
+        "prism.hadamard.axis": "input-last-dimension",
+        "prism.hadamard.weight_names": [],
+        "prism.hadamard.inverse_weight_names": [],
+        "prism.hadamard.sign_mode": "identity",
+        "prism.hadamard.gdn_v_grouped": False,
+    }
+    runtime = Bonsai2NativeRuntime(
+        Path(lib_path), metadata, threads=1, max_rows=64
+    )
+    try:
+        qkv = rng_values(CONV_DIM, 0.15, 0x24680001)
+        history = [
+            rng_values(CONV_DIM, 0.12, 0x24680010 + i)
+            for i in range(3)
+        ]
+        kernels = rng_values(CONV_DIM * 4, 0.08, 0x24680020)
+        alpha = rng_values(V_HEADS, 0.5, 0x24680030)
+        beta_raw = rng_values(V_HEADS, 0.5, 0x24680040)
+        dt = rng_values(V_HEADS, 0.1, 0x24680050)
+        a = array("f", (
+            -0.01 - abs(v)
+            for v in rng_values(V_HEADS, 0.08, 0x24680060)
+        ))
+        z = rng_values(VALUE_DIM, 0.4, 0x24680070)
+        norm = array("f", (
+            0.75 + abs(v)
+            for v in rng_values(HEAD_DIM, 0.3, 0x24680080)
+        ))
+        state = rng_values(
+            V_HEADS * HEAD_DIM * HEAD_DIM, 0.01, 0x24680090
+        )
+
+        qref, kref, vref, gateref, betaref = reference_prepare(
+            qkv, history, kernels, alpha, beta_raw, dt, a
+        )
+        captured.clear()
+        gated = runtime.recurrent_mid(
+            FakeStateLib(),
+            state,
+            qkv,
+            history,
+            memoryview(kernels),
+            alpha,
+            beta_raw,
+            memoryview(dt),
+            memoryview(a),
+            z,
+            memoryview(norm),
+            eps=gdn.RMS_EPS,
+            scale=SCALE_GDN,
+        )
+        expected = {
+            "q": qref.tobytes(),
+            "k": kref.tobytes(),
+            "v": vref.tobytes(),
+            "gate": gateref.tobytes(),
+            "beta": betaref.tobytes(),
+        }
+        for name, ref in expected.items():
+            if captured.get(name) != ref:
+                raise AssertionError(f"runtime wrapper {name} mismatch")
+
+        gated_ref = array("f", [0.0]) * VALUE_DIM
+        rc = lib.qwen_bonsai2_gdn_norm_gate_f32(
+            ptr(vref), ptr(norm), ptr(z), V_HEADS, HEAD_DIM,
+            ctypes.c_float(gdn.RMS_EPS), ptr(gated_ref)
+        )
+        if rc != 0:
+            raise AssertionError(f"wrapper norm reference rc={rc}")
+        if bytes_f32(gated) != gated_ref.tobytes():
+            raise AssertionError("runtime wrapper gated mismatch")
+    finally:
+        runtime.close()
+
+
 def main() -> None:
     global lib
     if len(sys.argv) != 2:
@@ -200,6 +290,7 @@ def main() -> None:
     if gated.tobytes() != gated_ref.tobytes():
         raise AssertionError("gated output bitwise mismatch")
 
+    verify_runtime_wrapper(sys.argv[1])
     print("QWEN38_BONSAI2_RECURRENT_MID_BITWISE_PASS")
 
 
