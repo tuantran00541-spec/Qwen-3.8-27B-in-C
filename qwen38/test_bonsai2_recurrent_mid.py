@@ -166,6 +166,15 @@ def verify_runtime_wrapper(lib_path: str) -> None:
             qkv, history, kernels, alpha, beta_raw, dt, a
         )
         captured.clear()
+        borrow_calls = 0
+        original_borrow = runtime._borrow_f32
+
+        def counted_borrow(values, expected):
+            nonlocal borrow_calls
+            borrow_calls += 1
+            return original_borrow(values, expected)
+
+        runtime._borrow_f32 = counted_borrow
         gated = runtime.recurrent_mid(
             FakeStateLib(),
             state,
@@ -181,6 +190,11 @@ def verify_runtime_wrapper(lib_path: str) -> None:
             eps=gdn.RMS_EPS,
             scale=SCALE_GDN,
         )
+        if borrow_calls != 12:
+            raise AssertionError(
+                f"recurrent_mid borrowed {borrow_calls} F32 inputs; expected 12"
+            )
+
         expected = {
             "q": qref.tobytes(),
             "k": kref.tobytes(),
