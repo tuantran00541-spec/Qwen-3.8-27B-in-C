@@ -326,7 +326,7 @@ class Bonsai2NativeRuntime:
         if rc != 0:
             raise RuntimeError(f"native Bonsai 2 SwiGLU failed rc={rc}")
         started = time.perf_counter()
-        result = [float(out[i]) for i in range(n)]
+        result = self._marshal_f32_output(out, n)
         self._record_timing("output_copy", started)
         return result
 
@@ -353,7 +353,7 @@ class Bonsai2NativeRuntime:
         if rc != 0:
             raise RuntimeError(f"native Bonsai 2 attention gate failed rc={rc}")
         started = time.perf_counter()
-        result = [float(out[i]) for i in range(n)]
+        result = self._marshal_f32_output(out, n)
         self._record_timing("output_copy", started)
         return result
 
@@ -465,7 +465,7 @@ class Bonsai2NativeRuntime:
             raise RuntimeError(f"native Bonsai 2 attention core failed rc={rc}")
 
         started = time.perf_counter()
-        result = [float(out[i]) for i in range(q_dim)]
+        result = self._marshal_f32_output(out, q_dim)
         self._record_timing("output_copy", started)
         return result
 
@@ -530,7 +530,7 @@ class Bonsai2NativeRuntime:
         if rc != 0:
             raise RuntimeError(f"native Bonsai 2 residual add failed rc={rc}")
         started = time.perf_counter()
-        result = [float(out[i]) for i in range(n)]
+        result = self._marshal_f32_output(out, n)
         self._record_timing("output_copy", started)
         return result
 
@@ -582,7 +582,7 @@ class Bonsai2NativeRuntime:
             raise RuntimeError(f"native GDN conv+SiLU failed rc={rc}")
 
         started = time.perf_counter()
-        result = [float(out[i]) for i in range(n)]
+        result = self._marshal_f32_output(out, n)
         self._record_timing("output_copy", started)
         return result
 
@@ -624,7 +624,7 @@ class Bonsai2NativeRuntime:
             raise RuntimeError(f"native GDN norm+gate failed rc={rc}")
 
         started = time.perf_counter()
-        result = [float(out[i]) for i in range(n)]
+        result = self._marshal_f32_output(out, n)
         self._record_timing("output_copy", started)
         return result
 
@@ -653,7 +653,7 @@ class Bonsai2NativeRuntime:
         if rc != 0:
             raise RuntimeError(f"native RMSNorm failed rc={rc}")
         started = time.perf_counter()
-        result = [float(out[i]) for i in range(n)]
+        result = self._marshal_f32_output(out, n)
         self._record_timing("output_copy", started)
         return result
 
@@ -777,7 +777,7 @@ class Bonsai2NativeRuntime:
                 )
         self._record_timing("lookup_dequantize", started)
         started = time.perf_counter()
-        result = [float(out[i]) for i in range(n)]
+        result = self._marshal_f32_output(out, n)
         self._record_timing("output_copy", started)
         return result
 
