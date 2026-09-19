@@ -1,0 +1,38 @@
+name: Bonsai 2 native FFN superkernel
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/test_bonsai2_native_ffn.py
+      - qwen38/bonsai2_persistent_pool_portable.c
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - qwen38/bonsai2_quant_runtime.py
+      - .github/workflows/bonsai2-native-ffn.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-ffn:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build native runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared \
+            qwen38/bonsai2_persistent_pool_portable.c \
+            -pthread -lm -o /tmp/libbonsai2-native-ffn.so
+      - name: Run native FFN bitwise gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python qwen38/test_bonsai2_native_ffn.py \
+            /tmp/libbonsai2-native-ffn.so
