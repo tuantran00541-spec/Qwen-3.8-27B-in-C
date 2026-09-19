@@ -675,21 +675,6 @@ class Bonsai2NativeRuntime:
         if len(history) > 3:
             raise ValueError(f"GDN history rows={len(history)} exceeds 3")
 
-        owners = []
-        for values, expected in (
-            (state, state_elems),
-            (qkv, conv_dim),
-            (kernels, conv_dim * 4),
-            (alpha, value_heads),
-            (beta_raw, value_heads),
-            (dt, value_heads),
-            (a, value_heads),
-            (z, value_dim),
-            (norm_weight, head_dim),
-        ):
-            owner, _ = self._borrow_f32(values, expected)
-            owners.append(owner)
-
         state_owner, state_ptr = self._borrow_f32(state, state_elems)
         qkv_owner, qkv_ptr = self._borrow_f32(qkv, conv_dim)
         kernels_owner, kernels_ptr = self._borrow_f32(kernels, conv_dim * 4)
@@ -734,7 +719,6 @@ class Bonsai2NativeRuntime:
         )
         self._record_timing("recurrent_mid", started)
         _ = (
-            owners,
             state_owner,
             qkv_owner,
             kernels_owner,
