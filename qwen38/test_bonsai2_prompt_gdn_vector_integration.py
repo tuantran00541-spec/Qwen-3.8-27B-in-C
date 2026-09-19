@@ -17,6 +17,18 @@ class ProbeRuntime:
         self.norm_gate_calls = 0
         self.history_lengths: list[int] = []
         self.ssm_out_input = None
+        self.rms_norm_calls = 0
+
+    def rms_norm(self, values, weight, *, rows=1, eps=1e-6):
+        self.rms_norm_calls += 1
+        width = len(weight)
+        assert rows >= 1
+        assert len(values) == rows * width
+        out = []
+        for row in range(rows):
+            start = row * width
+            out.extend(gdn.rms_norm(values[start:start + width], weight, eps))
+        return out
 
     def prepare_activation(self, weight_name, x):
         return ("prepared", weight_name, len(x))
@@ -133,6 +145,10 @@ def main() -> None:
     assert runtime.norm_gate_calls == 1, (
         "prompt recurrent_step must delegate state norm+gate exactly once, "
         f"calls={runtime.norm_gate_calls}"
+    )
+    assert runtime.rms_norm_calls == 2, (
+        "prompt recurrent_step must delegate both layer RMSNorms to native runtime, "
+        f"calls={runtime.rms_norm_calls}"
     )
     assert runtime.ssm_out_input == [0.25] * gdn.VALUE_DIM
 
