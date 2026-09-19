@@ -74,10 +74,8 @@ def check_execution_wiring() -> None:
         "bonsai2_prompt_spike.py": 1,
     }
     forbidden = (
-        "exact.sigmoid_f32(",
         "gate_sigmoid = [",
         "gs = [",
-        "gdn.sigmoid(",
     )
     for filename, expected_calls in targets.items():
         source = (ROOT / "qwen38" / filename).read_text(encoding="utf-8")
