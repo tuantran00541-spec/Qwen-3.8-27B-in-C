@@ -500,6 +500,44 @@ static inline int32_t qwen_bonsai2_ptq1_dot_trits8_sse(
     return _mm_cvtsi128_si32(sum32);
 }
 
+/* Exact integer-dot variants that remove the redundant 16-bit product
+ * materialization. PTQ1 trits are {-1,0,+1} and Q8 values are int8, so every
+ * q*a product fits exactly in int16 and VPMADDWD/PMADDWD can accumulate the
+ * same adjacent products directly into int32 lanes. */
+static inline int32_t qwen_bonsai2_ptq1_dot_trits16_madd_avx2(
+        const uint8_t *packed, uint16_t pow3, const int8_t *activation) {
+    const __m128i raw8 = _mm_loadu_si128((const __m128i *)packed);
+    __m256i v = _mm256_cvtepu8_epi16(raw8);
+    v = _mm256_mullo_epi16(v, _mm256_set1_epi16((short)pow3));
+    v = _mm256_and_si256(v, _mm256_set1_epi16(0x00ff));
+    v = _mm256_mullo_epi16(v, _mm256_set1_epi16(3));
+    __m256i q = _mm256_srli_epi16(v, 8);
+    q = _mm256_sub_epi16(q, _mm256_set1_epi16(1));
+
+    const __m128i a8 = _mm_loadu_si128((const __m128i *)activation);
+    const __m256i a16 = _mm256_cvtepi8_epi16(a8);
+    const __m256i sum32 = _mm256_madd_epi16(q, a16);
+    return qwen_hsum8_i32(sum32);
+}
+
+static inline int32_t qwen_bonsai2_ptq1_dot_trits8_madd_sse(
+        const uint8_t *packed, uint16_t pow3, const int8_t *activation) {
+    const __m128i raw8 = _mm_loadl_epi64((const __m128i *)packed);
+    __m128i v = _mm_cvtepu8_epi16(raw8);
+    v = _mm_mullo_epi16(v, _mm_set1_epi16((short)pow3));
+    v = _mm_and_si128(v, _mm_set1_epi16(0x00ff));
+    v = _mm_mullo_epi16(v, _mm_set1_epi16(3));
+    __m128i q = _mm_srli_epi16(v, 8);
+    q = _mm_sub_epi16(q, _mm_set1_epi16(1));
+
+    const __m128i a8 = _mm_loadl_epi64((const __m128i *)activation);
+    const __m128i a16 = _mm_cvtepi8_epi16(a8);
+    __m128i sum32 = _mm_madd_epi16(q, a16);
+    sum32 = _mm_hadd_epi32(sum32, sum32);
+    sum32 = _mm_hadd_epi32(sum32, sum32);
+    return _mm_cvtsi128_si32(sum32);
+}
+
 /* Fused PTQ1 decoder + Q8 dot.
  *
  * PTQ1's 24 qs bytes decode in two Prism stages: 16 bytes x 5 trits
@@ -585,17 +623,17 @@ static float qwen_bonsai2_vec_dot_ptq1_q8_0_fused_cached_scales(
 
         int32_t dots[4] = {0, 0, 0, 0};
 
-        dots[0] += qwen_bonsai2_ptq1_dot_trits16_avx2(qs, pow3[0], a0 + 0);
-        dots[0] += qwen_bonsai2_ptq1_dot_trits16_avx2(qs, pow3[1], a0 + 16);
-        dots[1] += qwen_bonsai2_ptq1_dot_trits16_avx2(qs, pow3[2], a1 + 0);
-        dots[1] += qwen_bonsai2_ptq1_dot_trits16_avx2(qs, pow3[3], a1 + 16);
-        dots[2] += qwen_bonsai2_ptq1_dot_trits16_avx2(qs, pow3[4], a2 + 0);
+        dots[0] += qwen_bonsai2_ptq1_dot_trits16_madd_avx2(qs, pow3[0], a0 + 0);
+        dots[0] += qwen_bonsai2_ptq1_dot_trits16_madd_avx2(qs, pow3[1], a0 + 16);
+        dots[1] += qwen_bonsai2_ptq1_dot_trits16_madd_avx2(qs, pow3[2], a1 + 0);
+        dots[1] += qwen_bonsai2_ptq1_dot_trits16_madd_avx2(qs, pow3[3], a1 + 16);
+        dots[2] += qwen_bonsai2_ptq1_dot_trits16_madd_avx2(qs, pow3[4], a2 + 0);
 
-        dots[2] += qwen_bonsai2_ptq1_dot_trits8_sse(qs + 16, pow3[0], a2 + 16);
-        dots[2] += qwen_bonsai2_ptq1_dot_trits8_sse(qs + 16, pow3[1], a2 + 24);
-        dots[3] += qwen_bonsai2_ptq1_dot_trits8_sse(qs + 16, pow3[2], a3 + 0);
-        dots[3] += qwen_bonsai2_ptq1_dot_trits8_sse(qs + 16, pow3[3], a3 + 8);
-        dots[3] += qwen_bonsai2_ptq1_dot_trits8_sse(qs + 16, pow3[4], a3 + 16);
+        dots[2] += qwen_bonsai2_ptq1_dot_trits8_madd_sse(qs + 16, pow3[0], a2 + 16);
+        dots[2] += qwen_bonsai2_ptq1_dot_trits8_madd_sse(qs + 16, pow3[1], a2 + 24);
+        dots[3] += qwen_bonsai2_ptq1_dot_trits8_madd_sse(qs + 16, pow3[2], a3 + 0);
+        dots[3] += qwen_bonsai2_ptq1_dot_trits8_madd_sse(qs + 16, pow3[3], a3 + 8);
+        dots[3] += qwen_bonsai2_ptq1_dot_trits8_madd_sse(qs + 16, pow3[4], a3 + 16);
 
         for (int nn = 0; nn < 4; ++nn) {
             for (int h = 0; h < 2; ++h) {
