@@ -1,0 +1,31 @@
+name: Bonsai 2 PTQ1 cached activation scales
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/test_bonsai2_ptq1_cached_scales.c
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - .github/workflows/bonsai2-ptq1-cached-scales.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ptq1-cached-scales:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile PTQ1 cached-scale gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gcc -O3 -std=c11 -mavx2 -mfma \
+            -Werror=implicit-function-declaration \
+            qwen38/test_bonsai2_ptq1_cached_scales.c -pthread -lm \
+            -o bonsai2-ptq1-cached-scales
+      - name: Run PTQ1 cached-scale bitwise and same-run benchmark
+        shell: bash
+        run: ./bonsai2-ptq1-cached-scales
