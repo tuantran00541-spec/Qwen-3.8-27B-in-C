@@ -185,6 +185,23 @@ class Bonsai2NativeRuntime:
             self.lib.qwen_bonsai2_pool_create.restype = ctypes.c_void_p
             self.lib.qwen_bonsai2_pool_destroy.argtypes = [ctypes.c_void_p]
             self.lib.qwen_bonsai2_pool_destroy.restype = None
+            self.lib.qwen_bonsai2_pool_ffn_ptq1_0.argtypes = [
+                ctypes.c_void_p,
+                _C_FP,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                _C_U8P,
+                ctypes.c_size_t,
+                _C_U8P,
+                ctypes.c_size_t,
+                _C_U8P,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                _C_I8P,
+                _C_I8P,
+                _C_FP,
+            ]
+            self.lib.qwen_bonsai2_pool_ffn_ptq1_0.restype = ctypes.c_int
             for name in (
                 "qwen_bonsai2_pool_matvec_ptq1_0",
                 "qwen_bonsai2_pool_matvec_pq2_0",
@@ -257,6 +274,7 @@ class Bonsai2NativeRuntime:
             "gdn_repeat_scale",
             "gdn_norm_gate",
             "recurrent_mid",
+            "ffn",
             "rms_norm",
             "output_copy",
         )
@@ -806,6 +824,80 @@ class Bonsai2NativeRuntime:
             raise RuntimeError(f"native RMSNorm failed rc={rc}")
         started = time.perf_counter()
         result = self._marshal_f32_output(out, n)
+        self._record_timing("output_copy", started)
+        return result
+
+    def ffn(
+        self,
+        x: Sequence[float],
+        gate_weights: memoryview,
+        gate_meta: Mapping[str, Any],
+        up_weights: memoryview,
+        up_meta: Mapping[str, Any],
+        down_weights: memoryview,
+        down_meta: Mapping[str, Any],
+    ) -> list[float]:
+        if not self.pool:
+            raise RuntimeError("native FFN superkernel requires persistent pool")
+
+        gate_kind = str(gate_meta["type_name"])
+        up_kind = str(up_meta["type_name"])
+        down_kind = str(down_meta["type_name"])
+        if gate_kind != "PTQ1_0" or up_kind != "PTQ1_0" or down_kind != "PTQ1_0":
+            raise ValueError(
+                "native FFN superkernel requires PTQ1_0 gate/up/down weights"
+            )
+
+        hidden, intermediate = map(int, gate_meta["shape"])
+        up_hidden, up_intermediate = map(int, up_meta["shape"])
+        down_intermediate, down_hidden = map(int, down_meta["shape"])
+        if (
+            up_hidden != hidden
+            or up_intermediate != intermediate
+            or down_intermediate != intermediate
+            or down_hidden != hidden
+        ):
+            raise ValueError(
+                "native FFN geometry mismatch: "
+                f"gate={list(gate_meta['shape'])} "
+                f"up={list(up_meta['shape'])} "
+                f"down={list(down_meta['shape'])}"
+            )
+        if len(x) != hidden:
+            raise ValueError(f"native FFN input width={len(x)} expected={hidden}")
+
+        x_owner, x_ptr = self._borrow_f32(x, hidden)
+        gate_arr = (ctypes.c_uint8 * len(gate_weights)).from_buffer(gate_weights)
+        up_arr = (ctypes.c_uint8 * len(up_weights)).from_buffer(up_weights)
+        down_arr = (ctypes.c_uint8 * len(down_weights)).from_buffer(down_weights)
+        sign_hidden_owner, sign_hidden = self._sign_array(hidden)
+        sign_intermediate_owner, sign_intermediate = self._sign_array(intermediate)
+        out = (ctypes.c_float * hidden)()
+
+        started = time.perf_counter()
+        rc = self.lib.qwen_bonsai2_pool_ffn_ptq1_0(
+            self.pool,
+            x_ptr,
+            hidden,
+            intermediate,
+            gate_arr,
+            len(gate_weights),
+            up_arr,
+            len(up_weights),
+            down_arr,
+            len(down_weights),
+            self.block_size,
+            sign_hidden,
+            sign_intermediate,
+            out,
+        )
+        self._record_timing("ffn", started)
+        _ = (x_owner, sign_hidden_owner, sign_intermediate_owner)
+        if rc != 0:
+            raise RuntimeError(f"native FFN superkernel failed rc={rc}")
+
+        started = time.perf_counter()
+        result = self._marshal_f32_output(out, hidden)
         self._record_timing("output_copy", started)
         return result
 
