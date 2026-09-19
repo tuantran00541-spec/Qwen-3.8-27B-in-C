@@ -73,7 +73,8 @@ static int exact_case(size_t rows, size_t n, size_t n_vec) {
     uint8_t *acts = (uint8_t *)malloc(n_vec * ar);
     float *reference = (float *)malloc(n_vec * rows * sizeof(float));
     float *many = (float *)malloc(n_vec * rows * sizeof(float));
-    if (!weights || !acts || !reference || !many) return 90;
+    float *packed = (float *)malloc(n_vec * rows * sizeof(float));
+    if (!weights || !acts || !reference || !many || !packed) return 90;
 
     fill_ptq1(weights, rows, n);
     for (size_t v = 0; v < n_vec; ++v) fill_q8(acts + v * ar, n);
@@ -110,10 +111,35 @@ static int exact_case(size_t rows, size_t n, size_t n_vec) {
         return 1;
     }
 
+    const int packed_rc = qwen_bonsai2_matvec_many_ptq1_0_q8_0_packed(
+        weights, rows * wr, rows, n,
+        acts, ar, n_vec, packed);
+    if (packed_rc != 0) {
+        fprintf(stderr, "PTQ1 packed-many rc=%d rows=%zu n=%zu nv=%zu\n",
+                packed_rc, rows, n, n_vec);
+        return 93;
+    }
+    if (memcmp(reference, packed, n_vec * rows * sizeof(float)) != 0) {
+        for (size_t i = 0; i < n_vec * rows; ++i) {
+            uint32_t a, b;
+            memcpy(&a, reference + i, sizeof(a));
+            memcpy(&b, packed + i, sizeof(b));
+            if (a != b) {
+                fprintf(stderr,
+                        "PTQ1 packed-many mismatch nv=%zu index=%zu "
+                        "ref=%08x got=%08x\n",
+                        n_vec, i, a, b);
+                break;
+            }
+        }
+        return 2;
+    }
+
     free(weights);
     free(acts);
     free(reference);
     free(many);
+    free(packed);
     return 0;
 }
 
@@ -156,17 +182,34 @@ static int bench_case(size_t n_vec) {
         many_sink += out[(size_t)rep % (n_vec * rows)];
     }
     const double many_s = now_seconds() - t0;
-    sink_value = seq_sink + many_sink;
+
+    t0 = now_seconds();
+    float packed_sink = 0.0f;
+    for (int rep = 0; rep < repeats; ++rep) {
+        const int rc = qwen_bonsai2_matvec_many_ptq1_0_q8_0_packed(
+            weights, rows * wr, rows, n,
+            acts, ar, n_vec, out);
+        if (rc != 0) return 96;
+        packed_sink += out[(size_t)rep % (n_vec * rows)];
+    }
+    const double packed_s = now_seconds() - t0;
+    sink_value = seq_sink + many_sink + packed_sink;
 
     printf("QWEN38_BONSAI2_PTQ1_MANY_BENCH "
            "nv=%zu rows=%zu n=%zu repeats=%d "
-           "sequential_seconds=%.9f many_seconds=%.9f speedup=%.4fx "
+           "sequential_seconds=%.9f decoded_many_seconds=%.9f "
+           "packed_many_seconds=%.9f "
+           "decoded_speedup=%.4fx packed_speedup=%.4fx "
+           "packed_vs_decoded=%.4fx "
            "effective_vectors_per_second_seq=%.3f "
-           "effective_vectors_per_second_many=%.3f\n",
+           "effective_vectors_per_second_packed=%.3f\n",
            n_vec, rows, n, repeats,
-           sequential_s, many_s, sequential_s / many_s,
+           sequential_s, many_s, packed_s,
+           sequential_s / many_s,
+           sequential_s / packed_s,
+           many_s / packed_s,
            (double)(repeats * n_vec) / sequential_s,
-           (double)(repeats * n_vec) / many_s);
+           (double)(repeats * n_vec) / packed_s);
 
     free(weights);
     free(acts);
