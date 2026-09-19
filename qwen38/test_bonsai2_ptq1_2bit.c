@@ -120,10 +120,17 @@ static int benchmark(void) {
     uint8_t *src = (uint8_t *)malloc(rows * src_row);
     uint8_t *dst = (uint8_t *)malloc(rows * dst_row);
     uint8_t *act = (uint8_t *)malloc(act_bytes);
-    if (!src || !dst || !act) return 92;
+    const size_t q8_blocks = n / QWEN_QK8_0;
+    float *activation_scales = (float *)malloc(q8_blocks * sizeof(float));
+    if (!src || !dst || !act || !activation_scales) return 92;
 
     for (size_t r = 0; r < rows; ++r) fill_ptq1(src + r * src_row, n);
     fill_q8(act, n);
+    for (size_t ib = 0; ib < q8_blocks; ++ib) {
+        const uint8_t *ab = act + ib * QWEN_BLOCK_Q8_0;
+        activation_scales[ib] =
+            qwen_f16_to_f32(qwen_load_u16_le(ab));
+    }
     for (size_t r = 0; r < rows; ++r) {
         const int rc = qwen_bonsai2_expand_ptq1_2bit(
             src + r * src_row, src_row, n,
@@ -138,8 +145,12 @@ static int benchmark(void) {
     double t0 = now_seconds();
     for (int rep = 0; rep < repeats; ++rep) {
         for (size_t r = 0; r < rows; ++r) {
-            sum_ref += qwen_bonsai2_vec_dot_ptq1_q8_0(
-                src + r * src_row, act, n, lut);
+            sum_ref += qwen_bonsai2_vec_dot_ptq1_q8_0_fused_cached_scales(
+                src + r * src_row,
+                act,
+                activation_scales,
+                n,
+                lut);
         }
     }
     const double ref_s = now_seconds() - t0;
@@ -156,7 +167,7 @@ static int benchmark(void) {
     sink_value = sum_ref + sum_new;
 
     printf("QWEN38_BONSAI2_PTQ1_2BIT_BENCH "
-           "rows=%zu n=%zu repeats=%d ref_seconds=%.9f "
+           "rows=%zu n=%zu repeats=%d production_seconds=%.9f "
            "candidate_seconds=%.9f speedup=%.4fx "
            "storage_ratio=%.6f\n",
            rows, n, repeats, ref_s, new_s, ref_s / new_s,
@@ -165,6 +176,7 @@ static int benchmark(void) {
     free(src);
     free(dst);
     free(act);
+    free(activation_scales);
     return 0;
 }
 
