@@ -158,6 +158,19 @@ def main() -> None:
         if got != want:
             raise AssertionError("native FFN output is not bitwise identical")
 
+        wrapped = runtime.ffn(
+            x,
+            memoryview(gate_w),
+            gate_meta,
+            memoryview(up_w),
+            up_meta,
+            memoryview(down_w),
+            down_meta,
+        )
+        wrapped_arr = (ctypes.c_float * HIDDEN)(*wrapped)
+        if bytes(memoryview(wrapped_arr).cast("B")) != want:
+            raise AssertionError("runtime FFN wrapper is not bitwise identical")
+
         print("QWEN38_BONSAI2_NATIVE_FFN_BITWISE_PASS")
     finally:
         runtime.close()
