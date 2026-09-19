@@ -667,20 +667,9 @@ int qwen_bonsai2_matvec_pq2_0_q8_0(
 int qwen_bonsai2_matvec_ptq1_0_q8_0(
         const uint8_t *weights, size_t weights_bytes, size_t rows, size_t n,
         const uint8_t *activation, size_t activation_bytes, float *out) {
-    if (!weights || !activation || !out || rows == 0 || n == 0 ||
-        n % QWEN_QK_PTQ1_0 != 0) return -1;
-    const size_t wr = (n / QWEN_QK_PTQ1_0) * QWEN_BLOCK_PTQ1_0;
-    const size_t ar = (n / QWEN_QK8_0) * QWEN_BLOCK_Q8_0;
-    if (activation_bytes != ar) return -2;
-    if (weights_bytes != rows * wr) return -3;
-
-    int8_t lut[256][5];
-    qwen_bonsai2_ptq1_lut(lut);
-    for (size_t r = 0; r < rows; ++r) {
-        out[r] = qwen_bonsai2_vec_dot_ptq1_q8_0_fused(
-            weights + r * wr, activation, n, lut);
-    }
-    return 0;
+    return qwen_bonsai2_matvec_ptq1_0_q8_0_cached_scales(
+        weights, weights_bytes, rows, n,
+        activation, activation_bytes, out);
 }
 
 /* Prism applies optional element signs, then a normalized Sylvester-Walsh
