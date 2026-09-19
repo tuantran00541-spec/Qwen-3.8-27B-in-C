@@ -9,6 +9,7 @@ on:
       - qwen38/bonsai2_persistent_pool_portable.c
       - qwen38/bonsai2_quant_dot_avx2.c
       - qwen38/bonsai2_quant_runtime.py
+      - qwen38/bonsai2_two_token.py
       - .github/workflows/bonsai2-native-ffn.yml
   workflow_dispatch:
 
