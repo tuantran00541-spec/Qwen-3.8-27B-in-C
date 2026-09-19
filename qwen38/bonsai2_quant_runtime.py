@@ -107,6 +107,10 @@ class Bonsai2NativeRuntime:
             _C_FP, _C_FP, ctypes.c_size_t, _C_FP
         ]
         self.lib.qwen_bonsai2_attention_gate_f32.restype = ctypes.c_int
+        self.lib.qwen_bonsai2_residual_add_f32.argtypes = [
+            _C_FP, _C_FP, ctypes.c_size_t, _C_FP
+        ]
+        self.lib.qwen_bonsai2_residual_add_f32.restype = ctypes.c_int
         self.lib.qwen_bonsai2_gdn_conv_silu_f32.argtypes = [
             _C_FP, _C_FP, ctypes.c_size_t, _C_FP, ctypes.c_size_t, _C_FP
         ]
@@ -207,6 +211,7 @@ class Bonsai2NativeRuntime:
             "lookup_dequantize",
             "swiglu",
             "attention_gate",
+            "residual_add",
             "gdn_conv_silu",
             "gdn_norm_gate",
             "rms_norm",
@@ -326,6 +331,31 @@ class Bonsai2NativeRuntime:
         self._record_timing("attention_gate", started)
         if rc != 0:
             raise RuntimeError(f"native Bonsai 2 attention gate failed rc={rc}")
+        started = time.perf_counter()
+        result = [float(out[i]) for i in range(n)]
+        self._record_timing("output_copy", started)
+        return result
+
+    def residual_add(
+        self,
+        a: Sequence[float],
+        b: Sequence[float],
+    ) -> list[float]:
+        if len(a) != len(b):
+            raise ValueError(
+                f"residual-add shape mismatch a={len(a)} b={len(b)}"
+            )
+        n = len(a)
+        if n == 0:
+            return []
+        a_arr = (ctypes.c_float * n)(*map(float, a))
+        b_arr = (ctypes.c_float * n)(*map(float, b))
+        out = (ctypes.c_float * n)()
+        started = time.perf_counter()
+        rc = self.lib.qwen_bonsai2_residual_add_f32(a_arr, b_arr, n, out)
+        self._record_timing("residual_add", started)
+        if rc != 0:
+            raise RuntimeError(f"native Bonsai 2 residual add failed rc={rc}")
         started = time.perf_counter()
         result = [float(out[i]) for i in range(n)]
         self._record_timing("output_copy", started)

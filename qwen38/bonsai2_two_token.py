@@ -183,10 +183,10 @@ def recurrent_step(runtime, state_lib, state, prev_qkv, view, metas, vec,
     norm_w = vec("ssm_norm.weight")
     gated = runtime.gdn_norm_gate(core, norm_w, z, eps=gdn.RMS_EPS)
     linear = runtime.matvec(view("ssm_out.weight"), metas[f"{p}.ssm_out.weight"], gated)
-    residual = [addf(hidden[i], linear[i]) for i in range(gdn.HIDDEN)]
+    residual = runtime.residual_add(hidden, linear)
     post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)
     fo = ffn(runtime, view, metas, p, post)
-    return [addf(residual[i], fo[i]) for i in range(gdn.HIDDEN)], qkv
+    return runtime.residual_add(residual, fo), qkv
 
 
 def softmax2(a: float, b: float) -> tuple[float, float]:
@@ -236,10 +236,10 @@ def full_attn_step(runtime, cache, view, metas, vec, hidden: Sequence[float], la
 
     gated = runtime.attention_sigmoid_mul(pregate, gate)
     ao = runtime.matvec(view("attn_output.weight"), metas[f"{p}.attn_output.weight"], gated)
-    residual = [addf(hidden[i], ao[i]) for i in range(gdn.HIDDEN)]
+    residual = runtime.residual_add(hidden, ao)
     post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)
     fo = ffn(runtime, view, metas, p, post)
-    final = [addf(residual[i], fo[i]) for i in range(gdn.HIDDEN)]
+    final = runtime.residual_add(residual, fo)
     return final, {"Qcur": q_rope, "Kcur": k_rope, "Vcur": v}
 
 

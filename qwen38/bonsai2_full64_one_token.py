@@ -206,10 +206,10 @@ def run_recurrent_layer(runtime, view, metas, vec, hidden: Sequence[float], laye
     attn_out = runtime.matvec(
         view("ssm_out.weight"), metas[f"{p}.ssm_out.weight"], gdn.flatten(gated)
     )
-    residual = [float(hidden[i]) + attn_out[i] for i in range(HIDDEN)]
+    residual = runtime.residual_add(hidden, attn_out)
     post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)
     ffn = run_ffn(runtime, view, metas, p, post)
-    return [residual[i] + ffn[i] for i in range(HIDDEN)]
+    return runtime.residual_add(residual, ffn)
 
 
 def run_full_attention_layer(
@@ -247,10 +247,10 @@ def run_full_attention_layer(
     attn_out = runtime.matvec(
         view("attn_output.weight"), metas[f"{p}.attn_output.weight"], gated
     )
-    residual = [float(hidden[i]) + attn_out[i] for i in range(HIDDEN)]
+    residual = runtime.residual_add(hidden, attn_out)
     post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)
     ffn = run_ffn(runtime, view, metas, p, post)
-    return [residual[i] + ffn[i] for i in range(HIDDEN)], (len(k_cache) + len(v_cache)) * 2
+    return runtime.residual_add(residual, ffn), (len(k_cache) + len(v_cache)) * 2
 
 
 def stream_lowbit_logits(

@@ -183,10 +183,10 @@ def recurrent_step(
     linear = runtime.matvec(
         view("ssm_out.weight"), metas[f"{p}.ssm_out.weight"], gated
     )
-    residual = [addf(hidden[i], linear[i]) for i in range(gdn.HIDDEN)]
+    residual = runtime.residual_add(hidden, linear)
     post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)
     ffn = t2.ffn(runtime, view, metas, p, post)
-    return [addf(residual[i], ffn[i]) for i in range(gdn.HIDDEN)], qkv
+    return runtime.residual_add(residual, ffn), qkv
 
 
 def full_attention_step(
@@ -254,10 +254,10 @@ def full_attention_step(
     attn_out = runtime.matvec(
         view("attn_output.weight"), metas[f"{p}.attn_output.weight"], gated
     )
-    residual = [addf(hidden[i], attn_out[i]) for i in range(gdn.HIDDEN)]
+    residual = runtime.residual_add(hidden, attn_out)
     post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)
     ffn = t2.ffn(runtime, view, metas, p, post)
-    return [addf(residual[i], ffn[i]) for i in range(gdn.HIDDEN)]
+    return runtime.residual_add(residual, ffn)
 
 
 class StatefulBonsai2Generator:

@@ -89,6 +89,18 @@ QWEN_EXPORT int qwen_bonsai2_attention_gate_f32(
     return 0;
 }
 
+QWEN_EXPORT int qwen_bonsai2_residual_add_f32(
+        const float *a,
+        const float *b,
+        size_t n,
+        float *out) {
+    if (!a || !b || !out || n == 0) return -1;
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = qwen_bonsai2_round_add_f32(a[i], b[i]);
+    }
+    return 0;
+}
+
 QWEN_EXPORT int qwen_bonsai2_gdn_conv_silu_f32(
         const float *qkv,
         const float *history,
