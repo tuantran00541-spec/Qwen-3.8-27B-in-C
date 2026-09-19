@@ -135,15 +135,15 @@ def rope_text_neox(values: Sequence[float], heads: int, pos: int) -> list[float]
 
 
 def ffn(runtime, view, metas, prefix: str, x: Sequence[float]) -> list[float]:
-    prepared = runtime.prepare_activation(f"{prefix}.ffn_gate.weight", x)
-    gate = runtime.matvec_prepared(
-        view("ffn_gate.weight"), metas[f"{prefix}.ffn_gate.weight"], prepared
+    return runtime.ffn(
+        x,
+        view("ffn_gate.weight"),
+        metas[f"{prefix}.ffn_gate.weight"],
+        view("ffn_up.weight"),
+        metas[f"{prefix}.ffn_up.weight"],
+        view("ffn_down.weight"),
+        metas[f"{prefix}.ffn_down.weight"],
     )
-    up = runtime.matvec_prepared(
-        view("ffn_up.weight"), metas[f"{prefix}.ffn_up.weight"], prepared
-    )
-    sw = runtime.swiglu(gate, up)
-    return runtime.matvec(view("ffn_down.weight"), metas[f"{prefix}.ffn_down.weight"], sw)
 
 
 def recurrent_step(runtime, state_lib, state, prev_qkv, view, metas, vec,
