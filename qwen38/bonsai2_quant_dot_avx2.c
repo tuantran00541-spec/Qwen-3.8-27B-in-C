@@ -49,6 +49,97 @@ QWEN_EXPORT int qwen_bonsai2_swiglu_f32(
     return 0;
 }
 
+
+static inline float qwen_bonsai2_round_add_f32(float a, float b) {
+    volatile float r = a + b;
+    return r;
+}
+
+static inline float qwen_bonsai2_round_mul_f32(float a, float b) {
+    volatile float r = a * b;
+    return r;
+}
+
+static inline float qwen_bonsai2_round_div_f32(float a, float b) {
+    volatile float r = a / b;
+    return r;
+}
+
+static inline float qwen_bonsai2_sigmoid_f32_exact(float x) {
+    const float e = expf(-x);
+    const float denom = qwen_bonsai2_round_add_f32(1.0f, e);
+    return qwen_bonsai2_round_div_f32(1.0f, denom);
+}
+
+static inline float qwen_bonsai2_silu_f32_exact(float x) {
+    return qwen_bonsai2_round_mul_f32(
+        x, qwen_bonsai2_sigmoid_f32_exact(x));
+}
+
+QWEN_EXPORT int qwen_bonsai2_gdn_conv_silu_f32(
+        const float *qkv,
+        const float *history,
+        size_t history_count,
+        const float *kernels,
+        size_t n,
+        float *out) {
+    if (!qkv || !kernels || !out || n == 0 || history_count > 3) return -1;
+    if (history_count > 0 && !history) return -2;
+
+    for (size_t cidx = 0; cidx < n; ++cidx) {
+        float cur = qwen_bonsai2_round_mul_f32(
+            qkv[cidx], kernels[cidx * 4 + 3]);
+        for (size_t lag = 1; lag <= history_count; ++lag) {
+            const size_t hist_index = history_count - lag;
+            const float prior = history[hist_index * n + cidx];
+            const float term = qwen_bonsai2_round_mul_f32(
+                prior, kernels[cidx * 4 + (3 - lag)]);
+            cur = qwen_bonsai2_round_add_f32(cur, term);
+        }
+        out[cidx] = qwen_bonsai2_silu_f32_exact(cur);
+    }
+    return 0;
+}
+
+QWEN_EXPORT int qwen_bonsai2_gdn_norm_gate_f32(
+        const float *core,
+        const float *norm_weight,
+        const float *z,
+        size_t heads,
+        size_t head_dim,
+        float eps,
+        float *out) {
+    if (!core || !norm_weight || !z || !out ||
+        heads == 0 || head_dim == 0) {
+        return -1;
+    }
+
+    for (size_t h = 0; h < heads; ++h) {
+        const size_t base = h * head_dim;
+        double sum_sq = 0.0;
+        for (size_t d = 0; d < head_dim; ++d) {
+            const float v = core[base + d];
+            const float sq = qwen_bonsai2_round_mul_f32(v, v);
+            sum_sq += (double)sq;
+        }
+        const float mean = (float)(sum_sq / (double)head_dim);
+        const float mean_eps = qwen_bonsai2_round_add_f32(mean, eps);
+        const float root = sqrtf(mean_eps);
+        const float scale = qwen_bonsai2_round_div_f32(1.0f, root);
+
+        for (size_t d = 0; d < head_dim; ++d) {
+            const size_t idx = base + d;
+            const float scaled = qwen_bonsai2_round_mul_f32(
+                core[idx], scale);
+            const float normalized = qwen_bonsai2_round_mul_f32(
+                scaled, norm_weight[d]);
+            out[idx] = qwen_bonsai2_round_mul_f32(
+                normalized, qwen_bonsai2_silu_f32_exact(z[idx]));
+        }
+    }
+    return 0;
+}
+
 static inline int32_t qwen_bonsai2_dot_i8_32_avx2(
         const int8_t *a, const int8_t *b) {
     const __m128i a0 = _mm_loadu_si128((const __m128i *)(a + 0));
