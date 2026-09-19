@@ -21,6 +21,7 @@ class ProbeRuntime:
         self.residual_add_calls = 0
         self.gdn_repeat_scale_calls = 0
         self.recurrent_mid_calls = 0
+        self.ffn_calls = 0
 
     def rms_norm(self, values, weight, *, rows=1, eps=1e-6):
         self.rms_norm_calls += 1
@@ -49,6 +50,26 @@ class ProbeRuntime:
         self.residual_add_calls += 1
         assert len(a) == len(b)
         return [float(a[i]) + float(b[i]) for i in range(len(a))]
+
+    def ffn(
+        self,
+        x,
+        gate_weights,
+        gate_meta,
+        up_weights,
+        up_meta,
+        down_weights,
+        down_meta,
+    ):
+        self.ffn_calls += 1
+        assert len(x) == gdn.HIDDEN
+        assert gate_weights == "ffn_gate.weight"
+        assert up_weights == "ffn_up.weight"
+        assert down_weights == "ffn_down.weight"
+        assert gate_meta["name"].endswith("ffn_gate.weight")
+        assert up_meta["name"].endswith("ffn_up.weight")
+        assert down_meta["name"].endswith("ffn_down.weight")
+        return [0.0] * gdn.HIDDEN
 
     def prepare_activation(self, weight_name, x):
         return ("prepared", weight_name, len(x))
@@ -221,6 +242,9 @@ def main() -> None:
         f"calls={runtime.gdn_repeat_scale_calls}"
     )
     assert runtime.ssm_out_input == [0.25] * gdn.VALUE_DIM
+    assert runtime.ffn_calls == 1, (
+        f"prompt recurrent path must delegate FFN exactly once, calls={runtime.ffn_calls}"
+    )
 
     print("QWEN38_BONSAI2_PROMPT_GDN_VECTOR_INTEGRATION_PASS")
 

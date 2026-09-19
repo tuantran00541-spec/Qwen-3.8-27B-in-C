@@ -13,32 +13,27 @@ import qwen35_gdn_quant_layer_gate as gdn
 
 class ProbeRuntime:
     def __init__(self) -> None:
-        self.swiglu_calls = 0
-        self.down_input = None
+        self.ffn_calls = 0
 
-    def prepare_activation(self, weight_name, x):
-        return ("prepared", weight_name, len(x))
-
-    def matvec_prepared(self, weights, meta, prepared):
-        name = str(meta["name"])
-        if name.endswith("ffn_gate.weight"):
-            return [0.25] * gdn.INTERMEDIATE
-        if name.endswith("ffn_up.weight"):
-            return [-0.5] * gdn.INTERMEDIATE
-        raise AssertionError(name)
-
-    def swiglu(self, gate, up):
-        self.swiglu_calls += 1
-        assert len(gate) == gdn.INTERMEDIATE
-        assert len(up) == gdn.INTERMEDIATE
-        return [0.125] * gdn.INTERMEDIATE
-
-    def matvec(self, weights, meta, x):
-        name = str(meta["name"])
-        assert name.endswith("ffn_down.weight"), name
-        self.down_input = list(x)
+    def ffn(
+        self,
+        x,
+        gate_weights,
+        gate_meta,
+        up_weights,
+        up_meta,
+        down_weights,
+        down_meta,
+    ):
+        self.ffn_calls += 1
+        assert len(x) == gdn.HIDDEN
+        assert gate_weights == "ffn_gate.weight"
+        assert up_weights == "ffn_up.weight"
+        assert down_weights == "ffn_down.weight"
+        assert gate_meta["name"].endswith("ffn_gate.weight")
+        assert up_meta["name"].endswith("ffn_up.weight")
+        assert down_meta["name"].endswith("ffn_down.weight")
         return [0.0] * gdn.HIDDEN
-
 
 def main() -> None:
     runtime = ProbeRuntime()
@@ -54,10 +49,9 @@ def main() -> None:
 
     out = t2.ffn(runtime, view, metas, prefix, [0.0] * gdn.HIDDEN)
     assert len(out) == gdn.HIDDEN
-    assert runtime.swiglu_calls == 1, (
-        f"FFN must delegate pointwise SwiGLU once, calls={runtime.swiglu_calls}"
+    assert runtime.ffn_calls == 1, (
+        f"FFN helper must delegate the native superkernel once, calls={runtime.ffn_calls}"
     )
-    assert runtime.down_input == [0.125] * gdn.INTERMEDIATE
     print("QWEN38_BONSAI2_FFN_NATIVE_SWIGLU_INTEGRATION_PASS")
 
 
