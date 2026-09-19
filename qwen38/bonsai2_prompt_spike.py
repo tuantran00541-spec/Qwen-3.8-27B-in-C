@@ -407,6 +407,9 @@ def run(
     output: Path,
     threads: int,
     resident_decoder: bool = False,
+    expected_text: str | None = None,
+    stream_text: bool = False,
+    json_events: bool = True,
 ) -> dict[str, Any]:
     started = time.monotonic()
     tokenizer = textgen.load_tokenizer(tokenizer_json)
@@ -436,14 +439,18 @@ def run(
             hidden = engine.step(token_id)
             elapsed = time.monotonic() - t0
             prefill_seconds.append(elapsed)
-            print(json.dumps({
-                "phase": "prefill",
-                "index": index,
-                "token": int(token_id),
-                "position": engine.position,
-                "seconds": elapsed,
-            }), flush=True)
+            if json_events:
+                print(json.dumps({
+                    "phase": "prefill",
+                    "index": index,
+                    "token": int(token_id),
+                    "position": engine.position,
+                    "seconds": elapsed,
+                }), flush=True)
         assert hidden is not None
+
+        generation_started = time.monotonic()
+        first_token_seconds: float | None = None
 
         for index in range(max_new_tokens):
             t0 = time.monotonic()
@@ -464,10 +471,15 @@ def run(
                 "logit_seconds": logit_seconds,
             }
             token_reports.append(report)
-            print(json.dumps({
-                "phase": "decode",
-                **report,
-            }, ensure_ascii=False), flush=True)
+            if first_token_seconds is None:
+                first_token_seconds = time.monotonic() - generation_started
+            if stream_text:
+                print(piece, end="", flush=True)
+            if json_events:
+                print(json.dumps({
+                    "phase": "decode",
+                    **report,
+                }, ensure_ascii=False), flush=True)
 
             if token_id in EOS_IDS:
                 break
@@ -479,10 +491,22 @@ def run(
         generated_text = tokenizer.decode(
             generated, skip_special_tokens=False
         )
-        expected = "Hello from Bonsai 2!"
-        exact_text_match = generated_text.strip() == expected
+        if stream_text:
+            print(flush=True)
+
+        stop_reason = (
+            "eos"
+            if generated and generated[-1] in EOS_IDS
+            else "max_new_tokens"
+        )
+        generation_seconds = time.monotonic() - generation_started
+        exact_text_match = (
+            None
+            if expected_text is None
+            else generated_text.strip() == expected_text.strip()
+        )
         result = {
-            "schema": "qwen38-bonsai2-real-prompt-spike-v1",
+            "schema": "qwen38-bonsai2-generation-v2",
             "status": "PASS" if generated else "FAIL",
             "lab_only": True,
             "model_sha256": base.MODEL_SHA256,
@@ -492,14 +516,11 @@ def run(
             "prompt_token_ids": prompt_ids,
             "generated_token_ids": generated,
             "generated_text": generated_text,
-            "expected_text": expected,
+            "expected_text": expected_text,
             "exact_text_match": exact_text_match,
             "token_reports": token_reports,
-            "stop_reason": (
-                "eos"
-                if generated and generated[-1] in EOS_IDS
-                else "max_new_tokens"
-            ),
+            "stop_reason": stop_reason,
+            "completion_truncated": stop_reason == "max_new_tokens",
             "threads": threads,
             "resident_decoder": resident_decoder,
             "timing": {
@@ -508,6 +529,13 @@ def run(
                     sum(prefill_seconds) / len(prefill_seconds)
                 ),
                 "decode_step_total_seconds_excluding_logits": sum(decode_seconds),
+                "generation_seconds_including_logits": generation_seconds,
+                "time_to_first_token_seconds": first_token_seconds,
+                "tokens_per_second": (
+                    len(generated) / generation_seconds
+                    if generation_seconds > 0.0
+                    else 0.0
+                ),
                 "elapsed_seconds": time.monotonic() - started,
             },
             "state": engine.report(),
@@ -523,7 +551,7 @@ def run(
             "prompt_token_count": result["prompt_token_count"],
             "generated_token_ids": result["generated_token_ids"],
             "generated_text": generated_text,
-            "expected_text": expected,
+            "expected_text": expected_text,
             "exact_text_match": exact_text_match,
             "stop_reason": result["stop_reason"],
             "timing": result["timing"],
@@ -545,9 +573,12 @@ def main() -> None:
     ap.add_argument("--state-lib", type=Path, required=True)
     ap.add_argument("--tokenizer-json", type=Path, required=True)
     ap.add_argument("--prompt", required=True)
-    ap.add_argument("--max-new-tokens", type=int, default=12)
+    ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--resident-decoder", action="store_true")
+    ap.add_argument("--expected-text")
+    ap.add_argument("--stream-text", action="store_true")
+    ap.add_argument("--no-json-events", action="store_true")
     ap.add_argument("--work-dir", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
     args = ap.parse_args()
@@ -562,6 +593,9 @@ def main() -> None:
         args.output,
         args.threads,
         args.resident_decoder,
+        args.expected_text,
+        args.stream_text,
+        not args.no_json_events,
     )
 
 
