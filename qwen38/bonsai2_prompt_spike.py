@@ -151,6 +151,11 @@ def profile_delta(
     components.update(state_seconds)
     component_calls.update(state_calls)
 
+    sections, section_calls = timing_delta(
+        "section_timing_seconds",
+        "section_timing_calls",
+    )
+
     before_reader = dict(before.get("reader", {}))
     after_reader = dict(after.get("reader", {}))
     reader = {
@@ -172,6 +177,8 @@ def profile_delta(
         "wall_seconds": wall_seconds,
         "components_seconds": components,
         "component_calls": component_calls,
+        "sections_seconds": sections,
+        "section_calls": section_calls,
         "reader": reader,
         "tracked_seconds": tracked_seconds,
         "untracked_seconds": untracked_seconds,
@@ -361,6 +368,14 @@ class StatefulBonsai2Generator:
             if layer % 4 == 3
         }
         self.position = 0
+        self.section_timing_seconds = {
+            "recurrent_layer": 0.0,
+            "attention_layer": 0.0,
+            "logits": 0.0,
+        }
+        self.section_timing_calls = {
+            key: 0 for key in self.section_timing_seconds
+        }
 
         work_dir.mkdir(parents=True, exist_ok=True)
         trunk = work_dir / "decoder64.k3.bin"
@@ -385,6 +400,10 @@ class StatefulBonsai2Generator:
         self.output_norm = base.read_f32_global(
             model, self.tensors["output_norm.weight"]
         )
+
+    def _record_section(self, key: str, started: float) -> None:
+        self.section_timing_seconds[key] += time.perf_counter() - started
+        self.section_timing_calls[key] += 1
 
     def close(self) -> None:
         try:
@@ -413,6 +432,7 @@ class StatefulBonsai2Generator:
                 return gdn.f32_vector(view(suffix))
 
             if layer % 4 == 3:
+                section_started = time.perf_counter()
                 hidden = full_attention_step(
                     self.runtime,
                     self.caches[layer],
@@ -423,7 +443,9 @@ class StatefulBonsai2Generator:
                     layer,
                     position,
                 )
+                self._record_section("attention_layer", section_started)
             else:
+                section_started = time.perf_counter()
                 hidden, qkv = recurrent_step(
                     self.runtime,
                     self.state_lib,
@@ -435,6 +457,7 @@ class StatefulBonsai2Generator:
                     hidden,
                     layer,
                 )
+                self._record_section("recurrent_layer", section_started)
                 history = self.conv_history[layer]
                 history.append(array("f", qkv))
                 if len(history) > 3:
@@ -445,13 +468,16 @@ class StatefulBonsai2Generator:
         return hidden
 
     def logits(self, hidden: Sequence[float]) -> list[float]:
+        section_started = time.perf_counter()
         normalized = self.runtime.rms_norm(hidden, self.output_norm, eps=gdn.RMS_EPS)
-        return base.stream_lowbit_logits(
+        result = base.stream_lowbit_logits(
             self.model,
             self.tensors["output.weight"],
             self.runtime,
             normalized,
         )
+        self._record_section("logits", section_started)
+        return result
 
     def profile_snapshot(self) -> dict[str, Any]:
         runtime = self.runtime.report()
@@ -470,6 +496,8 @@ class StatefulBonsai2Generator:
             "gdn_state_timing_calls": dict(
                 state.get("timing_calls", {})
             ),
+            "section_timing_seconds": dict(self.section_timing_seconds),
+            "section_timing_calls": dict(self.section_timing_calls),
             "reader": {
                 key: int(reader.get(key, 0))
                 for key in ("bytes_read", "hits", "misses")
