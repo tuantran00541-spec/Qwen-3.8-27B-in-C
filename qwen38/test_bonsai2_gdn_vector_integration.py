@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "qwen38"))
+
+import bonsai2_two_token as t2
+import qwen35_gdn_quant_layer_gate as gdn
+
+
+class ProbeRuntime:
+    def __init__(self) -> None:
+        self.conv_calls = 0
+        self.norm_gate_calls = 0
+        self.ssm_out_input = None
+
+    def prepare_activation(self, weight_name, x):
+        return ("prepared", weight_name, len(x))
+
+    def matvec_prepared(self, weights, meta, prepared):
+        name = str(meta["name"])
+        if name.endswith("attn_qkv.weight"):
+            return [0.0] * gdn.CONV_DIM
+        if name.endswith("attn_gate.weight"):
+            return [0.0] * gdn.VALUE_DIM
+        if name.endswith("ffn_gate.weight"):
+            return [0.0] * gdn.INTERMEDIATE
+        if name.endswith("ffn_up.weight"):
+            return [0.0] * gdn.INTERMEDIATE
+        raise AssertionError(name)
+
+    def matvec(self, weights, meta, x):
+        name = str(meta["name"])
+        if name.endswith("ssm_beta.weight") or name.endswith("ssm_alpha.weight"):
+            return [0.0] * gdn.V_HEADS
+        if name.endswith("ssm_out.weight"):
+            self.ssm_out_input = list(x)
+            return [0.0] * gdn.HIDDEN
+        if name.endswith("ffn_down.weight"):
+            return [0.0] * gdn.HIDDEN
+        raise AssertionError(name)
+
+    def swiglu(self, gate, up):
+        return [0.0] * gdn.INTERMEDIATE
+
+    def gdn_conv_silu(self, qkv, history, kernels):
+        self.conv_calls += 1
+        assert len(qkv) == gdn.CONV_DIM
+        assert len(history) == 1
+        assert len(history[0]) == gdn.CONV_DIM
+        assert len(kernels) == gdn.CONV_DIM * gdn.CONV_KERNEL
+        return [0.0] * gdn.CONV_DIM
+
+    def gdn_norm_gate(self, core, norm_weight, z, *, eps=1e-6):
+        self.norm_gate_calls += 1
+        assert len(core) == gdn.VALUE_DIM
+        assert len(norm_weight) == gdn.HEAD_DIM
+        assert len(z) == gdn.VALUE_DIM
+        return [0.125] * gdn.VALUE_DIM
+
+
+class ProbeState:
+    def step(self, state, q, k, v, gate, beta, out):
+        for i in range(gdn.VALUE_DIM):
+            out[i] = 0.0
+        return 0
+
+
+def main() -> None:
+    runtime = ProbeRuntime()
+    state_lib = ProbeState()
+    prefix = "blk.0"
+
+    suffixes = (
+        "attn_qkv.weight",
+        "attn_gate.weight",
+        "ssm_beta.weight",
+        "ssm_alpha.weight",
+        "ssm_out.weight",
+        "ffn_gate.weight",
+        "ffn_up.weight",
+        "ffn_down.weight",
+    )
+    metas = {
+        f"{prefix}.{suffix}": {"name": f"{prefix}.{suffix}"}
+        for suffix in suffixes
+    }
+
+    vectors = {
+        "attn_norm.weight": [1.0] * gdn.HIDDEN,
+        "ssm_dt.bias": [0.0] * gdn.V_HEADS,
+        "ssm_a": [0.0] * gdn.V_HEADS,
+        "ssm_conv1d.weight": [0.0] * (gdn.CONV_DIM * gdn.CONV_KERNEL),
+        "ssm_norm.weight": [1.0] * gdn.HEAD_DIM,
+        "post_attention_norm.weight": [1.0] * gdn.HIDDEN,
+    }
+
+    def view(suffix: str):
+        return suffix
+
+    def vec(suffix: str):
+        return vectors[suffix]
+
+    out, qkv = t2.recurrent_step(
+        runtime,
+        state_lib,
+        object(),
+        [0.0] * gdn.CONV_DIM,
+        view,
+        metas,
+        vec,
+        [0.0] * gdn.HIDDEN,
+        0,
+        1,
+    )
+
+    assert len(out) == gdn.HIDDEN
+    assert len(qkv) == gdn.CONV_DIM
+    assert runtime.conv_calls == 1, (
+        f"recurrent_step must delegate conv+SiLU exactly once, calls={runtime.conv_calls}"
+    )
+    assert runtime.norm_gate_calls == 1, (
+        "recurrent_step must delegate state norm+gate exactly once, "
+        f"calls={runtime.norm_gate_calls}"
+    )
+    assert runtime.ssm_out_input == [0.125] * gdn.VALUE_DIM, (
+        "ssm_out must consume native norm+gate output"
+    )
+
+    print("QWEN38_BONSAI2_GDN_VECTOR_INTEGRATION_PASS")
+
+
+if __name__ == "__main__":
+    main()
