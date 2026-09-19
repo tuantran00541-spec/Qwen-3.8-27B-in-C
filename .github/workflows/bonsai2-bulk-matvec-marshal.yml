@@ -1,0 +1,28 @@
+name: Bonsai 2 bulk matvec marshal
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/test_bonsai2_bulk_matvec_marshal.py
+      - qwen38/bonsai2_quant_runtime.py
+      - .github/workflows/bonsai2-bulk-matvec-marshal.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bulk-matvec-marshal:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run bulk matvec output marshal bitwise and wiring gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python qwen38/test_bonsai2_bulk_matvec_marshal.py
