@@ -220,7 +220,8 @@ def main() -> None:
         if bytes(memoryview(wrapped_arr).cast("B")) != want:
             raise AssertionError("runtime FFN wrapper is not bitwise identical")
 
-        verify_t2_ffn_delegates_once()\n        print("QWEN38_BONSAI2_NATIVE_FFN_BITWISE_PASS")
+        verify_t2_ffn_delegates_once()
+        print("QWEN38_BONSAI2_NATIVE_FFN_BITWISE_PASS")
     finally:
         runtime.close()
 
