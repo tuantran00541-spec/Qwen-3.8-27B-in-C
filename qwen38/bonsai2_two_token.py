@@ -164,12 +164,8 @@ def recurrent_step(runtime, state_lib, state, prev_qkv, view, metas, vec,
     gate = [mulf(aa[h], softplusf(addf(alpha[h], dt[h]))) for h in range(gdn.V_HEADS)]
 
     kernels = vec("ssm_conv1d.weight")
-    conv = [0.0] * gdn.CONV_DIM
-    for c in range(gdn.CONV_DIM):
-        cur = mulf(qkv[c], kernels[c*gdn.CONV_KERNEL + 3])
-        if token_index > 0:
-            cur = addf(mulf(prev_qkv[c], kernels[c*gdn.CONV_KERNEL + 2]), cur)
-        conv[c] = siluf(cur)
+    history = [] if token_index == 0 else [prev_qkv]
+    conv = runtime.gdn_conv_silu(qkv, history, kernels)
 
     q = conv[:gdn.KEY_DIM]; k = conv[gdn.KEY_DIM:2*gdn.KEY_DIM]; v = conv[2*gdn.KEY_DIM:]
     qn = gdn.flatten([gdn.l2_norm(h) for h in gdn.split_heads(q, gdn.K_HEADS)])
@@ -185,11 +181,7 @@ def recurrent_step(runtime, state_lib, state, prev_qkv, view, metas, vec,
     core = [float(out_buf[i]) for i in range(gdn.VALUE_DIM)]
 
     norm_w = vec("ssm_norm.weight")
-    core_h = gdn.split_heads(core, gdn.V_HEADS); z_h = gdn.split_heads(z, gdn.V_HEADS)
-    gated = []
-    for ch, zh in zip(core_h, z_h):
-        nh = rmswrap.ggml_rms_norm(ch, norm_w, gdn.RMS_EPS)
-        gated.extend(mulf(nh[d], siluf(zh[d])) for d in range(gdn.HEAD_DIM))
+    gated = runtime.gdn_norm_gate(core, norm_w, z, eps=gdn.RMS_EPS)
     linear = runtime.matvec(view("ssm_out.weight"), metas[f"{p}.ssm_out.weight"], gated)
     residual = [addf(hidden[i], linear[i]) for i in range(gdn.HIDDEN)]
     post = gdn.rms_norm(residual, vec("post_attention_norm.weight"))
