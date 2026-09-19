@@ -453,6 +453,29 @@ class StatefulBonsai2Generator:
             normalized,
         )
 
+    def profile_snapshot(self) -> dict[str, Any]:
+        runtime = self.runtime.report()
+        state = self.state_lib.report()
+        reader = self.reader.report()
+        return {
+            "lowbit_runtime_timing_seconds": dict(
+                runtime.get("timing_seconds", {})
+            ),
+            "lowbit_runtime_timing_calls": dict(
+                runtime.get("timing_calls", {})
+            ),
+            "gdn_state_timing_seconds": dict(
+                state.get("timing_seconds", {})
+            ),
+            "gdn_state_timing_calls": dict(
+                state.get("timing_calls", {})
+            ),
+            "reader": {
+                key: int(reader.get(key, 0))
+                for key in ("bytes_read", "hits", "misses")
+            },
+        }
+
     def report(self) -> dict[str, Any]:
         conv_bytes = sum(
             len(history) * gdn.CONV_DIM * 4
@@ -527,9 +550,12 @@ def run(
         assert hidden is not None
 
         generation_started = time.monotonic()
+        generation_profile_before = engine.profile_snapshot()
         first_token_seconds: float | None = None
 
         for index in range(max_new_tokens):
+            cycle_started = time.monotonic()
+            profile_before = engine.profile_snapshot()
             t0 = time.monotonic()
             logits = engine.logits(hidden)
             top5 = base.topk(logits, 5)
@@ -547,23 +573,38 @@ def run(
                 "top5": top5,
                 "logit_seconds": logit_seconds,
             }
-            token_reports.append(report)
             if first_token_seconds is None:
                 first_token_seconds = time.monotonic() - generation_started
             if stream_text:
                 print(piece, end="", flush=True)
+
+            eos = token_id in EOS_IDS
+            includes_next_decoder_step = False
+            if not eos and index + 1 < max_new_tokens:
+                t1 = time.monotonic()
+                hidden = engine.step(token_id)
+                decode_seconds.append(time.monotonic() - t1)
+                includes_next_decoder_step = True
+
+            profile_after = engine.profile_snapshot()
+            report["critical_path"] = profile_delta(
+                profile_before,
+                profile_after,
+                wall_seconds=time.monotonic() - cycle_started,
+            )
+            report["critical_path"]["includes_next_decoder_step"] = (
+                includes_next_decoder_step
+            )
+            token_reports.append(report)
+
             if json_events:
                 print(json.dumps({
                     "phase": "decode",
                     **report,
                 }, ensure_ascii=False), flush=True)
 
-            if token_id in EOS_IDS:
+            if eos:
                 break
-            if index + 1 < max_new_tokens:
-                t1 = time.monotonic()
-                hidden = engine.step(token_id)
-                decode_seconds.append(time.monotonic() - t1)
 
         generated_text = tokenizer.decode(
             generated, skip_special_tokens=False
@@ -577,6 +618,11 @@ def run(
             else "max_new_tokens"
         )
         generation_seconds = time.monotonic() - generation_started
+        decode_critical_path = profile_delta(
+            generation_profile_before,
+            engine.profile_snapshot(),
+            wall_seconds=generation_seconds,
+        )
         exact_text_match = (
             None
             if expected_text is None
@@ -596,6 +642,7 @@ def run(
             "expected_text": expected_text,
             "exact_text_match": exact_text_match,
             "token_reports": token_reports,
+            "decode_critical_path": decode_critical_path,
             "stop_reason": stop_reason,
             "completion_truncated": stop_reason == "max_new_tokens",
             "threads": threads,
@@ -631,6 +678,7 @@ def run(
             "expected_text": expected_text,
             "exact_text_match": exact_text_match,
             "stop_reason": result["stop_reason"],
+            "decode_critical_path": result["decode_critical_path"],
             "timing": result["timing"],
             "state": result["state"],
             "max_rss_gib": result["max_rss_gib"],
