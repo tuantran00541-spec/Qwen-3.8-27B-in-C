@@ -57,7 +57,7 @@ def verify_decode_loop_wiring() -> None:
     source = (ROOT / "qwen38" / "bonsai2_prompt_spike.py").read_text(encoding="utf-8")
     required = (
         'profile_before = engine.profile_snapshot()',
-        '"critical_path": profile_delta(',
+        'report["critical_path"] = profile_delta(',
         '"decode_critical_path"',
     )
     for needle in required:
