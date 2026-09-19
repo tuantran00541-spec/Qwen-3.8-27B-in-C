@@ -224,49 +224,21 @@ def recurrent_step(
     alpha = runtime.matvec(
         view("ssm_alpha.weight"), metas[f"{p}.ssm_alpha.weight"], x
     )
-    beta = [exact.sigmoid_f32(value) for value in beta_raw]
-    dt = vec("ssm_dt.bias")
-    aa = vec("ssm_a")
-    gate = [
-        mulf(aa[h], t2.softplusf(addf(alpha[h], dt[h])))
-        for h in range(gdn.V_HEADS)
-    ]
-
-    kernels = vec("ssm_conv1d.weight")
-    conv = runtime.gdn_conv_silu(qkv, history, kernels)
-
-    q = conv[: gdn.KEY_DIM]
-    k = conv[gdn.KEY_DIM : 2 * gdn.KEY_DIM]
-    v = conv[2 * gdn.KEY_DIM :]
-    qn = gdn.flatten([
-        gdn.l2_norm(head) for head in gdn.split_heads(q, gdn.K_HEADS)
-    ])
-    kn = gdn.flatten([
-        gdn.l2_norm(head) for head in gdn.split_heads(k, gdn.K_HEADS)
-    ])
-    q48, k48 = runtime.gdn_repeat_scale(
-        qn,
-        kn,
-        repeats=gdn.V_HEADS // gdn.K_HEADS,
+    gated = runtime.recurrent_mid(
+        state_lib,
+        state,
+        qkv,
+        history,
+        view("ssm_conv1d.weight"),
+        alpha,
+        beta_raw,
+        view("ssm_dt.bias"),
+        view("ssm_a"),
+        z,
+        view("ssm_norm.weight"),
+        eps=gdn.RMS_EPS,
         scale=t2.SCALE_GDN,
     )
-
-    out_buf = (t2.ctypes.c_float * gdn.VALUE_DIM)()
-    rc = state_lib.step(
-        state,
-        t2.carr(q48),
-        t2.carr(k48),
-        t2.carr(v),
-        t2.carr(gate),
-        t2.carr(beta),
-        out_buf,
-    )
-    if rc != 0:
-        raise RuntimeError(f"layer {layer}: GDN state pool rc={rc}")
-    core = [float(out_buf[i]) for i in range(gdn.VALUE_DIM)]
-
-    norm_w = vec("ssm_norm.weight")
-    gated = runtime.gdn_norm_gate(core, norm_w, z, eps=gdn.RMS_EPS)
 
     linear = runtime.matvec(
         view("ssm_out.weight"), metas[f"{p}.ssm_out.weight"], gated
