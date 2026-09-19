@@ -39,6 +39,16 @@ def verify_profile_snapshot_contract() -> None:
         "hits": 6,
         "misses": 1,
     })
+    engine.section_timing_seconds = {
+        "recurrent_layer": 1.25,
+        "attention_layer": 0.5,
+        "logits": 0.1,
+    }
+    engine.section_timing_calls = {
+        "recurrent_layer": 48,
+        "attention_layer": 16,
+        "logits": 1,
+    }
 
     snap = engine.profile_snapshot()
     if snap["lowbit_runtime_timing_seconds"]["ptq1_matvec"] != 2.5:
@@ -48,6 +58,10 @@ def verify_profile_snapshot_contract() -> None:
     if snap["gdn_state_timing_seconds"]["step"] != 0.7:
         raise AssertionError(snap)
     if snap["gdn_state_timing_calls"]["step"] != 2:
+        raise AssertionError(snap)
+    if snap["section_timing_seconds"]["recurrent_layer"] != 1.25:
+        raise AssertionError(snap)
+    if snap["section_timing_calls"]["attention_layer"] != 16:
         raise AssertionError(snap)
     if snap["reader"] != {"bytes_read": 8192, "hits": 6, "misses": 1}:
         raise AssertionError(snap)
@@ -59,6 +73,9 @@ def verify_decode_loop_wiring() -> None:
         'profile_before = engine.profile_snapshot()',
         'report["critical_path"] = profile_delta(',
         '"decode_critical_path"',
+        'self._record_section("recurrent_layer"',
+        'self._record_section("attention_layer"',
+        'self._record_section("logits"',
     )
     for needle in required:
         if needle not in source:
@@ -79,6 +96,16 @@ def main() -> None:
         },
         "gdn_state_timing_seconds": {"step": 0.4},
         "gdn_state_timing_calls": {"step": 3},
+        "section_timing_seconds": {
+            "recurrent_layer": 4.0,
+            "attention_layer": 1.0,
+            "logits": 0.2,
+        },
+        "section_timing_calls": {
+            "recurrent_layer": 48,
+            "attention_layer": 16,
+            "logits": 1,
+        },
         "reader": {"bytes_read": 1000, "hits": 2, "misses": 1},
     }
     after = {
@@ -94,6 +121,16 @@ def main() -> None:
         },
         "gdn_state_timing_seconds": {"step": 0.9},
         "gdn_state_timing_calls": {"step": 5},
+        "section_timing_seconds": {
+            "recurrent_layer": 7.4,
+            "attention_layer": 1.8,
+            "logits": 0.35,
+        },
+        "section_timing_calls": {
+            "recurrent_layer": 96,
+            "attention_layer": 32,
+            "logits": 2,
+        },
         "reader": {"bytes_read": 5096, "hits": 5, "misses": 2},
     }
 
@@ -117,6 +154,18 @@ def main() -> None:
         raise AssertionError(calls)
     if calls["gdn_state_step"] != 2:
         raise AssertionError(calls)
+
+    sections = out["sections_seconds"]
+    close(sections["recurrent_layer"], 3.4)
+    close(sections["attention_layer"], 0.8)
+    close(sections["logits"], 0.15)
+    section_calls = out["section_calls"]
+    if section_calls["recurrent_layer"] != 48:
+        raise AssertionError(section_calls)
+    if section_calls["attention_layer"] != 16:
+        raise AssertionError(section_calls)
+    if section_calls["logits"] != 1:
+        raise AssertionError(section_calls)
 
     close(out["wall_seconds"], 4.0)
     close(out["tracked_seconds"], 3.0)
