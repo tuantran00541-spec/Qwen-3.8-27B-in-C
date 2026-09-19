@@ -559,6 +559,94 @@ static float qwen_bonsai2_vec_dot_ptq1_q8_0_fused(
     return sumf;
 }
 
+/* Experimental exact PTQ1 path that decodes the shared Q8_0 activation
+ * scales once per matvec rather than once per output-row/block.  The integer
+ * dot products and all floating-point accumulation order remain identical to
+ * qwen_bonsai2_vec_dot_ptq1_q8_0_fused(). */
+static float qwen_bonsai2_vec_dot_ptq1_q8_0_fused_cached_scales(
+        const uint8_t *weights,
+        const uint8_t *activation,
+        const float *activation_scales,
+        size_t n,
+        const int8_t lut[256][5]) {
+    static const uint16_t pow3[5] = {1, 3, 9, 27, 81};
+    const size_t nb = n / QWEN_QK_PTQ1_0;
+    float sumf = 0.0f;
+
+    for (size_t ib = 0; ib < nb; ++ib) {
+        const uint8_t *xb = weights + ib * QWEN_BLOCK_PTQ1_0;
+        const uint8_t *qs = xb;
+        const uint8_t *qh = xb + 24;
+        const uint8_t *yb = activation + ib * 4 * QWEN_BLOCK_Q8_0;
+        const int8_t *a0 = (const int8_t *)(yb + 0 * QWEN_BLOCK_Q8_0 + 2);
+        const int8_t *a1 = (const int8_t *)(yb + 1 * QWEN_BLOCK_Q8_0 + 2);
+        const int8_t *a2 = (const int8_t *)(yb + 2 * QWEN_BLOCK_Q8_0 + 2);
+        const int8_t *a3 = (const int8_t *)(yb + 3 * QWEN_BLOCK_Q8_0 + 2);
+
+        int32_t dots[4] = {0, 0, 0, 0};
+
+        dots[0] += qwen_bonsai2_ptq1_dot_trits16_avx2(qs, pow3[0], a0 + 0);
+        dots[0] += qwen_bonsai2_ptq1_dot_trits16_avx2(qs, pow3[1], a0 + 16);
+        dots[1] += qwen_bonsai2_ptq1_dot_trits16_avx2(qs, pow3[2], a1 + 0);
+        dots[1] += qwen_bonsai2_ptq1_dot_trits16_avx2(qs, pow3[3], a1 + 16);
+        dots[2] += qwen_bonsai2_ptq1_dot_trits16_avx2(qs, pow3[4], a2 + 0);
+
+        dots[2] += qwen_bonsai2_ptq1_dot_trits8_sse(qs + 16, pow3[0], a2 + 16);
+        dots[2] += qwen_bonsai2_ptq1_dot_trits8_sse(qs + 16, pow3[1], a2 + 24);
+        dots[3] += qwen_bonsai2_ptq1_dot_trits8_sse(qs + 16, pow3[2], a3 + 0);
+        dots[3] += qwen_bonsai2_ptq1_dot_trits8_sse(qs + 16, pow3[3], a3 + 8);
+        dots[3] += qwen_bonsai2_ptq1_dot_trits8_sse(qs + 16, pow3[4], a3 + 16);
+
+        for (int nn = 0; nn < 4; ++nn) {
+            for (int h = 0; h < 2; ++h) {
+                dots[3] +=
+                    (int32_t)lut[qh[h]][nn] *
+                    (int32_t)a3[24 + nn * 2 + h];
+            }
+        }
+
+        const float d0 = qwen_f16_to_f32(qwen_load_u16_le(xb + 26));
+        float sumi = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+            const float d1 = activation_scales[ib * 4 + (size_t)k];
+            sumi += d1 * (float)dots[k];
+        }
+        sumf += d0 * sumi;
+    }
+    return sumf;
+}
+
+static int qwen_bonsai2_matvec_ptq1_0_q8_0_cached_scales(
+        const uint8_t *weights, size_t weights_bytes, size_t rows, size_t n,
+        const uint8_t *activation, size_t activation_bytes, float *out) {
+    if (!weights || !activation || !out || rows == 0 || n == 0 ||
+        n % QWEN_QK_PTQ1_0 != 0) return -1;
+    const size_t wr = (n / QWEN_QK_PTQ1_0) * QWEN_BLOCK_PTQ1_0;
+    const size_t q8_blocks = n / QWEN_QK8_0;
+    const size_t ar = q8_blocks * QWEN_BLOCK_Q8_0;
+    if (activation_bytes != ar) return -2;
+    if (weights_bytes != rows * wr) return -3;
+
+    float *activation_scales =
+        (float *)malloc(q8_blocks * sizeof(float));
+    if (!activation_scales) return -4;
+    for (size_t ib = 0; ib < q8_blocks; ++ib) {
+        const uint8_t *ab = activation + ib * QWEN_BLOCK_Q8_0;
+        activation_scales[ib] =
+            qwen_f16_to_f32(qwen_load_u16_le(ab));
+    }
+
+    int8_t lut[256][5];
+    qwen_bonsai2_ptq1_lut(lut);
+    for (size_t r = 0; r < rows; ++r) {
+        out[r] = qwen_bonsai2_vec_dot_ptq1_q8_0_fused_cached_scales(
+            weights + r * wr, activation, activation_scales, n, lut);
+    }
+
+    free(activation_scales);
+    return 0;
+}
+
 int qwen_bonsai2_matvec_pq2_0_q8_0(
         const uint8_t *weights, size_t weights_bytes, size_t rows, size_t n,
         const uint8_t *activation, size_t activation_bytes, float *out) {
