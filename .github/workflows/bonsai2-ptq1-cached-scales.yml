@@ -6,6 +6,7 @@ on:
       - test/bonsai2-27b
     paths:
       - qwen38/test_bonsai2_ptq1_cached_scales.c
+      - qwen38/test_bonsai2_ptq1_cached_scales_wiring.py
       - qwen38/bonsai2_quant_dot_avx2.c
       - .github/workflows/bonsai2-ptq1-cached-scales.yml
   workflow_dispatch:
@@ -29,3 +30,6 @@ jobs:
       - name: Run PTQ1 cached-scale bitwise and same-run benchmark
         shell: bash
         run: ./bonsai2-ptq1-cached-scales
+      - name: Require production PTQ1 cached-scale wiring
+        shell: bash
+        run: python qwen38/test_bonsai2_ptq1_cached_scales_wiring.py

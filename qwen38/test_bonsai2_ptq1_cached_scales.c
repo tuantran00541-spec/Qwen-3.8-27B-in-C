@@ -54,6 +54,29 @@ static void fill_fixture(
     }
 }
 
+static int reference_matvec(
+        const uint8_t *weights,
+        size_t weights_bytes,
+        size_t rows,
+        size_t n,
+        const uint8_t *activation,
+        size_t activation_bytes,
+        float *out) {
+    if (!weights || !activation || !out || rows == 0 || n == 0 ||
+        n % QWEN_QK_PTQ1_0 != 0) return -1;
+    const size_t wr = (n / QWEN_QK_PTQ1_0) * QWEN_BLOCK_PTQ1_0;
+    const size_t ar = (n / QWEN_QK8_0) * QWEN_BLOCK_Q8_0;
+    if (activation_bytes != ar || weights_bytes != rows * wr) return -2;
+
+    int8_t lut[256][5];
+    qwen_bonsai2_ptq1_lut(lut);
+    for (size_t r = 0; r < rows; ++r) {
+        out[r] = qwen_bonsai2_vec_dot_ptq1_q8_0_fused(
+            weights + r * wr, activation, n, lut);
+    }
+    return 0;
+}
+
 static int check_case(size_t rows, size_t n) {
     const size_t wr = (n / QWEN_QK_PTQ1_0) * QWEN_BLOCK_PTQ1_0;
     const size_t ab = (n / QWEN_QK8_0) * QWEN_BLOCK_Q8_0;
@@ -64,7 +87,7 @@ static int check_case(size_t rows, size_t n) {
     if (!weights || !activation || !reference || !candidate) return 90;
 
     fill_fixture(weights, rows, n, activation);
-    if (qwen_bonsai2_matvec_ptq1_0_q8_0(
+    if (reference_matvec(
             weights, rows * wr, rows, n,
             activation, ab, reference) != 0) return 91;
     if (qwen_bonsai2_matvec_ptq1_0_q8_0_cached_scales(
@@ -110,7 +133,7 @@ static int benchmark(void) {
     if (!weights || !activation || !out) return 94;
     fill_fixture(weights, ROWS, N, activation);
 
-    if (qwen_bonsai2_matvec_ptq1_0_q8_0(
+    if (reference_matvec(
             weights, (size_t)ROWS * wr, ROWS, N,
             activation, ab, out) != 0) return 95;
     if (qwen_bonsai2_matvec_ptq1_0_q8_0_cached_scales(
@@ -119,7 +142,7 @@ static int benchmark(void) {
 
     double t0 = now_s();
     for (int i = 0; i < REPS; ++i) {
-        if (qwen_bonsai2_matvec_ptq1_0_q8_0(
+        if (reference_matvec(
                 weights, (size_t)ROWS * wr, ROWS, N,
                 activation, ab, out) != 0) return 97;
     }
