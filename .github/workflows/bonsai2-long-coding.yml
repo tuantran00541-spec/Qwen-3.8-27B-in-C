@@ -1,0 +1,174 @@
+name: Bonsai 2 real coding generation
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - .github/workflows/bonsai2-long-coding.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coding-generation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Record runner
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/bonsai2-coding
+          { uname -a; lscpu; free -h; df -h .; } | tee work/bonsai2-coding/hardware.txt
+
+      - name: Build native runtime and tokenizer dependency
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared \
+            qwen38/bonsai2_persistent_pool_portable.c \
+            -pthread -lm \
+            -o work/bonsai2-coding/libbonsai2_quant.so
+          gcc -O3 -std=c11 -fPIC -shared \
+            qwen38/gdn_state_ar_portable_pool.c \
+            -pthread -lm \
+            -o work/bonsai2-coding/libgdn_state.so
+          python -m pip install --disable-pip-version-check tokenizers
+          python -m py_compile \
+            qwen38/bonsai2_prompt_spike.py \
+            qwen38/bonsai2_full64_one_token.py \
+            qwen38/bonsai2_two_token.py \
+            qwen38/bonsai2_quant_runtime.py
+
+      - name: Download verified model and pinned tokenizer
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p models/bonsai2 models/qwen-official
+
+          MODEL="models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+          MODEL_URL="https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/6ed5e12bf84b7a63069882c91dd9e9218647d17b/Ternary-Bonsai-2-27B-PTQ1_0.gguf?download=true"
+          MODEL_SHA="53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"
+          curl -fL --retry 10 --retry-all-errors -C - -o "$MODEL.part" "$MODEL_URL"
+          echo "$MODEL_SHA  $MODEL.part" | sha256sum -c -
+          mv "$MODEL.part" "$MODEL"
+
+          TOKENIZER="models/qwen-official/tokenizer.json"
+          TOKENIZER_URL="https://huggingface.co/Qwen/Qwen3.8-27B/resolve/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/tokenizer.json?download=true"
+          TOKENIZER_SHA="0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+          curl -fL --retry 10 --retry-all-errors -o "$TOKENIZER.part" "$TOKENIZER_URL"
+          echo "$TOKENIZER_SHA  $TOKENIZER.part" | sha256sum -c -
+          mv "$TOKENIZER.part" "$TOKENIZER"
+
+      - name: Run 256-token coding generation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/bonsai2-coding/k3
+          PROMPT="$(cat <<'EOF'
+Write valid Python source code only, with no Markdown fences and no prose outside the code.
+Implement:
+    merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]
+Requirements:
+- Return [] for empty input.
+- Normalize reversed endpoints, so (5, 2) is treated as (2, 5).
+- Sort by start position.
+- Merge overlapping intervals and intervals that touch at an endpoint.
+- Do not mutate the input list.
+- Include a concise docstring and type hints.
+- Under if __name__ == "__main__": include at least six assert-based tests covering empty input, one interval, overlap, touching, disjoint intervals, reversed endpoints, and a mixed case.
+The file must run successfully with Python 3.12.
+EOF
+)"
+          /usr/bin/time -v -o work/bonsai2-coding/time.txt \
+            python -u qwen38/bonsai2_prompt_spike.py \
+              --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+              --native-lib work/bonsai2-coding/libbonsai2_quant.so \
+              --state-lib work/bonsai2-coding/libgdn_state.so \
+              --tokenizer-json models/qwen-official/tokenizer.json \
+              --prompt "$PROMPT" \
+              --max-new-tokens 256 \
+              --threads 4 \
+              --resident-decoder \
+              --stream-text \
+              --no-json-events \
+              --work-dir work/bonsai2-coding/k3 \
+              --output work/bonsai2-coding/result.json \
+            2> >(tee work/bonsai2-coding/generation.stderr.txt >&2) \
+            | tee work/bonsai2-coding/generation.stdout.txt
+
+      - name: Extract generated Python and metrics
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          result_path = Path("work/bonsai2-coding/result.json")
+          if not result_path.exists():
+              raise SystemExit("result.json missing")
+          d = json.loads(result_path.read_text(encoding="utf-8"))
+          text = d.get("generated_text", "")
+          Path("work/bonsai2-coding/generated.raw.txt").write_text(text, encoding="utf-8")
+
+          code = text.strip()
+          fence = chr(96) * 3
+          if code.startswith(fence):
+              lines = code.splitlines()
+              lines = lines[1:]
+              if lines and lines[-1].strip() == fence:
+                  lines = lines[:-1]
+              code = "\n".join(lines).strip()
+          Path("work/bonsai2-coding/generated.py").write_text(code + "\n", encoding="utf-8")
+
+          timing = d.get("timing", {})
+          print("CODING_STOP_REASON=" + str(d.get("stop_reason")))
+          print("CODING_COMPLETION_TRUNCATED=" + str(d.get("completion_truncated")))
+          print("CODING_PROMPT_TOKENS=" + str(d.get("prompt_token_count")))
+          print("CODING_GENERATED_TOKENS=" + str(len(d.get("generated_token_ids", []))))
+          print("CODING_TTFT_SECONDS=" + str(timing.get("time_to_first_token_seconds")))
+          print("CODING_TOKENS_PER_SECOND=" + str(timing.get("tokens_per_second")))
+          print("CODING_PREFILL_SECONDS=" + str(timing.get("prefill_total_seconds")))
+          print("CODING_GENERATION_SECONDS=" + str(timing.get("generation_seconds_including_logits")))
+          print("CODING_ELAPSED_SECONDS=" + str(timing.get("elapsed_seconds")))
+          print("CODING_MAX_RSS_GIB=" + str(d.get("max_rss_gib")))
+          PY
+
+      - name: Compile and execute generated code
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m py_compile work/bonsai2-coding/generated.py
+          python work/bonsai2-coding/generated.py
+          echo QWEN38_BONSAI2_REAL_CODING_VALIDATION_PASS
+
+      - name: Drop large files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf models/bonsai2 models/qwen-official
+          rm -f work/bonsai2-coding/k3/decoder64.k3.bin
+          df -h .
+
+      - name: Upload coding evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai2-real-coding-generation
+          path: |
+            work/bonsai2-coding/*.json
+            work/bonsai2-coding/*.txt
+            work/bonsai2-coding/*.py
+            work/bonsai2-coding/k3/*.json
+          if-no-files-found: warn
+          retention-days: 30
