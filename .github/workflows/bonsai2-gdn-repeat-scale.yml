@@ -1,0 +1,42 @@
+name: Bonsai 2 native GDN repeat-scale
+
+on:
+  push:
+    branches:
+      - test/bonsai2-27b
+    paths:
+      - qwen38/test_bonsai2_native_gdn_repeat_scale.py
+      - qwen38/bonsai2_quant_runtime.py
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - qwen38/gdn_repeat_scale_exact.c
+      - qwen38/bonsai2_two_token.py
+      - qwen38/bonsai2_prompt_spike.py
+      - .github/workflows/bonsai2-gdn-repeat-scale.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gdn-repeat-scale:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build native runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/gdn-repeat-scale
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared \
+            qwen38/bonsai2_persistent_pool_portable.c \
+            -pthread -lm \
+            -o work/gdn-repeat-scale/libbonsai2_quant.so
+      - name: Run native GDN repeat-scale bitwise and wiring gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python qwen38/test_bonsai2_native_gdn_repeat_scale.py \
+            --native-lib work/gdn-repeat-scale/libbonsai2_quant.so
