@@ -6,6 +6,8 @@ on:
       - test/bonsai2-27b
     paths:
       - qwen38/test_bonsai2_native_gdn_vectors.py
+      - qwen38/test_bonsai2_gdn_vector_integration.py
+      - qwen38/bonsai2_two_token.py
       - qwen38/bonsai2_quant_runtime.py
       - qwen38/bonsai2_quant_dot_avx2.c
       - qwen38/bonsai2_persistent_pool_portable.c
@@ -38,3 +40,8 @@ jobs:
           set -euxo pipefail
           python qwen38/test_bonsai2_native_gdn_vectors.py \
             --native-lib work/gdn-vectors/libbonsai2_quant.so
+      - name: Run recurrent vector integration gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python qwen38/test_bonsai2_gdn_vector_integration.py
