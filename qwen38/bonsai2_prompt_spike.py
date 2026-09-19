@@ -102,6 +102,83 @@ def mulf(a: float, b: float) -> float:
     return t2.mulf(a, b)
 
 
+def profile_delta(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    wall_seconds: float,
+) -> dict[str, Any]:
+    wall_seconds = max(0.0, float(wall_seconds))
+
+    def timing_delta(
+        seconds_key: str,
+        calls_key: str,
+        *,
+        prefix: str = "",
+    ) -> tuple[dict[str, float], dict[str, int]]:
+        before_seconds = dict(before.get(seconds_key, {}))
+        after_seconds = dict(after.get(seconds_key, {}))
+        before_calls = dict(before.get(calls_key, {}))
+        after_calls = dict(after.get(calls_key, {}))
+
+        seconds: dict[str, float] = {}
+        calls: dict[str, int] = {}
+        for key in sorted(set(before_seconds) | set(after_seconds)):
+            name = f"{prefix}{key}"
+            seconds[name] = max(
+                0.0,
+                float(after_seconds.get(key, 0.0))
+                - float(before_seconds.get(key, 0.0)),
+            )
+        for key in sorted(set(before_calls) | set(after_calls)):
+            name = f"{prefix}{key}"
+            calls[name] = max(
+                0,
+                int(after_calls.get(key, 0))
+                - int(before_calls.get(key, 0)),
+            )
+        return seconds, calls
+
+    components, component_calls = timing_delta(
+        "lowbit_runtime_timing_seconds",
+        "lowbit_runtime_timing_calls",
+    )
+    state_seconds, state_calls = timing_delta(
+        "gdn_state_timing_seconds",
+        "gdn_state_timing_calls",
+        prefix="gdn_state_",
+    )
+    components.update(state_seconds)
+    component_calls.update(state_calls)
+
+    before_reader = dict(before.get("reader", {}))
+    after_reader = dict(after.get("reader", {}))
+    reader = {
+        key: max(
+            0,
+            int(after_reader.get(key, 0)) - int(before_reader.get(key, 0)),
+        )
+        for key in ("bytes_read", "hits", "misses")
+    }
+
+    tracked_seconds = sum(components.values())
+    untracked_seconds = max(0.0, wall_seconds - tracked_seconds)
+    tracked_fraction = (
+        tracked_seconds / wall_seconds
+        if wall_seconds > 0.0
+        else 0.0
+    )
+    return {
+        "wall_seconds": wall_seconds,
+        "components_seconds": components,
+        "component_calls": component_calls,
+        "reader": reader,
+        "tracked_seconds": tracked_seconds,
+        "untracked_seconds": untracked_seconds,
+        "tracked_fraction": tracked_fraction,
+    }
+
+
 def softmax_many(scores: Sequence[float]) -> list[float]:
     if not scores:
         raise ValueError("softmax requires at least one score")
