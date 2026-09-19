@@ -226,6 +226,208 @@ QWEN_EXPORT int qwen_bonsai2_gdn_norm_gate_f32(
     return 0;
 }
 
+
+#define QWEN_BONSAI2_GDN_K_HEADS 16
+#define QWEN_BONSAI2_GDN_V_HEADS 48
+#define QWEN_BONSAI2_GDN_HEAD_DIM 128
+#define QWEN_BONSAI2_GDN_KEY_DIM \
+    (QWEN_BONSAI2_GDN_K_HEADS * QWEN_BONSAI2_GDN_HEAD_DIM)
+#define QWEN_BONSAI2_GDN_VALUE_DIM \
+    (QWEN_BONSAI2_GDN_V_HEADS * QWEN_BONSAI2_GDN_HEAD_DIM)
+#define QWEN_BONSAI2_GDN_CONV_DIM \
+    (2 * QWEN_BONSAI2_GDN_KEY_DIM + QWEN_BONSAI2_GDN_VALUE_DIM)
+
+typedef int (*qwen_bonsai2_gdn_step_fn)(
+    void *opaque,
+    float *state,
+    const float *q,
+    const float *k,
+    const float *v,
+    const float *gate,
+    const float *beta,
+    float *out);
+
+/* Reproduce CPython math.fsum for finite positive terms closely enough for
+ * the Q/K L2-normalization path. Inputs are F32, products are evaluated in
+ * double exactly like float(v) * float(v) in Python, and the final sqrt/divide
+ * happen in double before the normalized value is materialized as F32. */
+static double qwen_bonsai2_fsum_squares_f32(
+        const float *x, size_t n) {
+    double partials[256];
+    size_t np = 0;
+
+    for (size_t ix = 0; ix < n; ++ix) {
+        const double vd = (double)x[ix];
+        double term = vd * vd;
+        size_t i = 0;
+        for (size_t j = 0; j < np; ++j) {
+            double y = partials[j];
+            if (fabs(term) < fabs(y)) {
+                const double tmp = term;
+                term = y;
+                y = tmp;
+            }
+            volatile double hi = term + y;
+            volatile double yr = hi - term;
+            volatile double lo = y - yr;
+            if (lo != 0.0) partials[i++] = lo;
+            term = hi;
+        }
+        np = i;
+        if (term != 0.0) {
+            if (np >= sizeof(partials) / sizeof(partials[0])) {
+                return HUGE_VAL;
+            }
+            partials[np++] = term;
+        }
+    }
+
+    if (np == 0) return 0.0;
+
+    double hi = partials[--np];
+    double lo = 0.0;
+    while (np > 0) {
+        const double xh = hi;
+        const double y = partials[--np];
+        volatile double next = xh + y;
+        volatile double yr = next - xh;
+        lo = y - yr;
+        hi = next;
+        if (lo != 0.0) break;
+    }
+
+    if (np > 0 &&
+        ((lo < 0.0 && partials[np - 1] < 0.0) ||
+         (lo > 0.0 && partials[np - 1] > 0.0))) {
+        const double y = lo * 2.0;
+        const double next = hi + y;
+        const double yr = next - hi;
+        if (y == yr) hi = next;
+    }
+    return hi;
+}
+
+static float qwen_bonsai2_softplus_f32_exact(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return (float)log1p((double)expf(x));
+}
+
+static const float *qwen_bonsai2_history_row(
+        const float *h0,
+        const float *h1,
+        const float *h2,
+        size_t count,
+        size_t index) {
+    if (index >= count) return NULL;
+    if (index == 0) return h0;
+    if (index == 1) return h1;
+    return h2;
+}
+
+QWEN_EXPORT int qwen_bonsai2_recurrent_mid_f32(
+        void *gdn_pool,
+        qwen_bonsai2_gdn_step_fn gdn_step,
+        float *state,
+        const float *qkv,
+        const float *history0,
+        const float *history1,
+        const float *history2,
+        size_t history_count,
+        const float *kernels,
+        const float *alpha,
+        const float *beta_raw,
+        const float *dt,
+        const float *a,
+        const float *z,
+        const float *norm_weight,
+        float rms_eps,
+        float gdn_scale,
+        float *gated_out) {
+    if (!gdn_step || !state || !qkv || !kernels || !alpha || !beta_raw ||
+        !dt || !a || !z || !norm_weight || !gated_out ||
+        history_count > 3) {
+        return -1;
+    }
+    if (history_count > 0 && !history0) return -2;
+    if (history_count > 1 && !history1) return -3;
+    if (history_count > 2 && !history2) return -4;
+
+    float conv[QWEN_BONSAI2_GDN_CONV_DIM];
+    float q48[QWEN_BONSAI2_GDN_VALUE_DIM];
+    float k48[QWEN_BONSAI2_GDN_VALUE_DIM];
+    float core[QWEN_BONSAI2_GDN_VALUE_DIM];
+    float gate[QWEN_BONSAI2_GDN_V_HEADS];
+    float beta[QWEN_BONSAI2_GDN_V_HEADS];
+
+    for (size_t h = 0; h < QWEN_BONSAI2_GDN_V_HEADS; ++h) {
+        beta[h] = qwen_bonsai2_sigmoid_f32_exact(beta_raw[h]);
+        const float alpha_dt = qwen_bonsai2_round_add_f32(alpha[h], dt[h]);
+        const float softplus = qwen_bonsai2_softplus_f32_exact(alpha_dt);
+        gate[h] = qwen_bonsai2_round_mul_f32(a[h], softplus);
+    }
+
+    for (size_t cidx = 0; cidx < QWEN_BONSAI2_GDN_CONV_DIM; ++cidx) {
+        float cur = qwen_bonsai2_round_mul_f32(
+            qkv[cidx], kernels[cidx * 4 + 3]);
+        for (size_t lag = 1; lag <= history_count; ++lag) {
+            const size_t hist_index = history_count - lag;
+            const float *prior = qwen_bonsai2_history_row(
+                history0, history1, history2, history_count, hist_index);
+            const float term = qwen_bonsai2_round_mul_f32(
+                prior[cidx], kernels[cidx * 4 + (3 - lag)]);
+            cur = qwen_bonsai2_round_add_f32(cur, term);
+        }
+        conv[cidx] = qwen_bonsai2_silu_f32_exact(cur);
+    }
+
+    for (size_t h = 0; h < QWEN_BONSAI2_GDN_K_HEADS; ++h) {
+        const size_t base = h * QWEN_BONSAI2_GDN_HEAD_DIM;
+        const float *qh = conv + base;
+        const float *kh = conv + QWEN_BONSAI2_GDN_KEY_DIM + base;
+        const double qsum = qwen_bonsai2_fsum_squares_f32(
+            qh, QWEN_BONSAI2_GDN_HEAD_DIM);
+        const double ksum = qwen_bonsai2_fsum_squares_f32(
+            kh, QWEN_BONSAI2_GDN_HEAD_DIM);
+        if (!isfinite(qsum) || !isfinite(ksum)) return -5;
+        double qdenom = sqrt(qsum);
+        double kdenom = sqrt(ksum);
+        if (qdenom < (double)rms_eps) qdenom = (double)rms_eps;
+        if (kdenom < (double)rms_eps) kdenom = (double)rms_eps;
+
+        for (size_t d = 0; d < QWEN_BONSAI2_GDN_HEAD_DIM; ++d) {
+            const float qnorm = (float)((double)qh[d] / qdenom);
+            const float knorm = (float)((double)kh[d] / kdenom);
+            for (size_t rep = 0;
+                 rep < QWEN_BONSAI2_GDN_V_HEADS /
+                       QWEN_BONSAI2_GDN_K_HEADS;
+                 ++rep) {
+                const size_t out_head =
+                    rep * QWEN_BONSAI2_GDN_K_HEADS + h;
+                const size_t out_index =
+                    out_head * QWEN_BONSAI2_GDN_HEAD_DIM + d;
+                q48[out_index] = qwen_bonsai2_round_mul_f32(
+                    qnorm, gdn_scale);
+                k48[out_index] = knorm;
+            }
+        }
+    }
+
+    const float *v = conv + 2 * QWEN_BONSAI2_GDN_KEY_DIM;
+    const int state_rc = gdn_step(
+        gdn_pool, state, q48, k48, v, gate, beta, core);
+    if (state_rc != 0) return -100 - state_rc;
+
+    return qwen_bonsai2_gdn_norm_gate_f32(
+        core,
+        norm_weight,
+        z,
+        QWEN_BONSAI2_GDN_V_HEADS,
+        QWEN_BONSAI2_GDN_HEAD_DIM,
+        rms_eps,
+        gated_out);
+}
+
 static inline int32_t qwen_bonsai2_dot_i8_32_avx2(
         const int8_t *a, const int8_t *b) {
     const __m128i a0 = _mm_loadu_si128((const __m128i *)(a + 0));
