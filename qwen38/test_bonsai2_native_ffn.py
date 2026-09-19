@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "qwen38"))
 
 from bonsai2_quant_runtime import Bonsai2NativeRuntime
+import bonsai2_two_token as t2
 
 HIDDEN = 256
 INTERMEDIATE = 512
@@ -68,6 +69,54 @@ def meta(name: str, n: int, rows: int) -> dict[str, object]:
         "type_name": "PTQ1_0",
         "shape": [n, rows],
     }
+
+
+
+class DelegationProbeRuntime:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def ffn(
+        self,
+        x,
+        gate_weights,
+        gate_meta,
+        up_weights,
+        up_meta,
+        down_weights,
+        down_meta,
+    ):
+        self.calls += 1
+        assert list(x) == [1.0, 2.0, 3.0]
+        assert gate_weights == "gate"
+        assert up_weights == "up"
+        assert down_weights == "down"
+        assert gate_meta["name"] == "blk.0.ffn_gate.weight"
+        assert up_meta["name"] == "blk.0.ffn_up.weight"
+        assert down_meta["name"] == "blk.0.ffn_down.weight"
+        return [9.0, 8.0, 7.0]
+
+
+def verify_t2_ffn_delegates_once() -> None:
+    runtime = DelegationProbeRuntime()
+    metas = {
+        "blk.0.ffn_gate.weight": {"name": "blk.0.ffn_gate.weight"},
+        "blk.0.ffn_up.weight": {"name": "blk.0.ffn_up.weight"},
+        "blk.0.ffn_down.weight": {"name": "blk.0.ffn_down.weight"},
+    }
+
+    def view(name: str):
+        return {
+            "ffn_gate.weight": "gate",
+            "ffn_up.weight": "up",
+            "ffn_down.weight": "down",
+        }[name]
+
+    out = t2.ffn(runtime, view, metas, "blk.0", [1.0, 2.0, 3.0])
+    if out != [9.0, 8.0, 7.0]:
+        raise AssertionError(out)
+    if runtime.calls != 1:
+        raise AssertionError(f"expected one native FFN delegation, got {runtime.calls}")
 
 
 def main() -> None:
@@ -171,7 +220,7 @@ def main() -> None:
         if bytes(memoryview(wrapped_arr).cast("B")) != want:
             raise AssertionError("runtime FFN wrapper is not bitwise identical")
 
-        print("QWEN38_BONSAI2_NATIVE_FFN_BITWISE_PASS")
+        verify_t2_ffn_delegates_once()\n        print("QWEN38_BONSAI2_NATIVE_FFN_BITWISE_PASS")
     finally:
         runtime.close()
 
