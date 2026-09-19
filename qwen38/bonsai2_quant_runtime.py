@@ -361,6 +361,21 @@ class Bonsai2NativeRuntime:
     def _array_f32_ptr(buf: array):
         return (ctypes.c_float * len(buf)).from_buffer(buf)
 
+    @staticmethod
+    def _marshal_f32_output(out, n: int) -> list[float]:
+        n = int(n)
+        if n < 0 or len(out) != n:
+            raise ValueError(f"F32 output length={len(out)} expected={n}")
+        if n == 0:
+            return []
+        flat = array("f")
+        flat.frombytes(memoryview(out).cast("B"))
+        if len(flat) != n:
+            raise RuntimeError(
+                f"bulk F32 marshal length={len(flat)} expected={n}"
+            )
+        return flat.tolist()
+
     def _sync_attention_cache(
         self,
         layer: int,
@@ -665,7 +680,7 @@ class Bonsai2NativeRuntime:
                 raise RuntimeError(f"{meta['name']}: native BF16 matvec failed rc={rc}")
             self.matvec_rows += rows
             started = time.perf_counter()
-            result = [float(out[i]) for i in range(rows)]
+            result = self._marshal_f32_output(out, rows)
             self._record_timing("output_copy", started)
             return result
 
@@ -710,7 +725,7 @@ class Bonsai2NativeRuntime:
             raise RuntimeError(f"{meta['name']}: native Bonsai 2 matvec failed rc={rc}")
         self.matvec_rows += rows
         started = time.perf_counter()
-        result = [float(out[i]) for i in range(rows)]
+        result = self._marshal_f32_output(out, rows)
         self._record_timing("output_copy", started)
         return result
 
