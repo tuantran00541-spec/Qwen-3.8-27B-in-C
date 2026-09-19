@@ -125,7 +125,7 @@ def recurrent_step(
     layer: int,
 ) -> tuple[list[float], list[float]]:
     p = f"blk.{layer}"
-    x = gdn.rms_norm(hidden, vec("attn_norm.weight"))
+    x = runtime.rms_norm(hidden, vec("attn_norm.weight"), eps=gdn.RMS_EPS)
 
     prepared = runtime.prepare_activation(f"{p}.attn_qkv.weight", x)
     qkv = runtime.matvec_prepared(
@@ -184,7 +184,7 @@ def recurrent_step(
         view("ssm_out.weight"), metas[f"{p}.ssm_out.weight"], gated
     )
     residual = [addf(hidden[i], linear[i]) for i in range(gdn.HIDDEN)]
-    post = gdn.rms_norm(residual, vec("post_attention_norm.weight"))
+    post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)
     ffn = t2.ffn(runtime, view, metas, p, post)
     return [addf(residual[i], ffn[i]) for i in range(gdn.HIDDEN)], qkv
 
@@ -200,7 +200,7 @@ def full_attention_step(
     position: int,
 ) -> list[float]:
     p = f"blk.{layer}"
-    x = gdn.rms_norm(hidden, vec("attn_norm.weight"))
+    x = runtime.rms_norm(hidden, vec("attn_norm.weight"), eps=gdn.RMS_EPS)
 
     prepared = runtime.prepare_activation(f"{p}.attn_q.weight", x)
     qg = runtime.matvec_prepared(
@@ -214,8 +214,8 @@ def full_attention_step(
     )
 
     q, gate = attn.split_q_gate(qg)
-    q = attn.rms_norm_heads(q, attn.N_HEAD, vec("attn_q_norm.weight"))
-    k = attn.rms_norm_heads(k, attn.N_HEAD_KV, vec("attn_k_norm.weight"))
+    q = runtime.rms_norm(q, vec("attn_q_norm.weight"), rows=attn.N_HEAD, eps=attn.RMS_EPS)
+    k = runtime.rms_norm(k, vec("attn_k_norm.weight"), rows=attn.N_HEAD_KV, eps=attn.RMS_EPS)
     q_rope = t2.rope_text_neox(q, attn.N_HEAD, position)
     k_rope = t2.rope_text_neox(k, attn.N_HEAD_KV, position)
 
@@ -259,7 +259,7 @@ def full_attention_step(
         view("attn_output.weight"), metas[f"{p}.attn_output.weight"], gated
     )
     residual = [addf(hidden[i], attn_out[i]) for i in range(gdn.HIDDEN)]
-    post = gdn.rms_norm(residual, vec("post_attention_norm.weight"))
+    post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)
     ffn = t2.ffn(runtime, view, metas, p, post)
     return [addf(residual[i], ffn[i]) for i in range(gdn.HIDDEN)]
 
@@ -387,7 +387,7 @@ class StatefulBonsai2Generator:
         return hidden
 
     def logits(self, hidden: Sequence[float]) -> list[float]:
-        normalized = gdn.rms_norm(hidden, self.output_norm)
+        normalized = self.runtime.rms_norm(hidden, self.output_norm, eps=gdn.RMS_EPS)
         return base.stream_lowbit_logits(
             self.model,
             self.tensors["output.weight"],

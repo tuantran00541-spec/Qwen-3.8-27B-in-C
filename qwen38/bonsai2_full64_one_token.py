@@ -148,7 +148,7 @@ def run_ffn(runtime, view, metas, prefix: str, x: Sequence[float]) -> list[float
 
 def run_recurrent_layer(runtime, view, metas, vec, hidden: Sequence[float], layer: int) -> list[float]:
     p = f"blk.{layer}"
-    x = gdn.rms_norm(hidden, vec("attn_norm.weight"))
+    x = runtime.rms_norm(hidden, vec("attn_norm.weight"), eps=gdn.RMS_EPS)
 
     # qkv/z share the same 5120-wide folded activation.
     prepared = runtime.prepare_activation(f"{p}.attn_qkv.weight", x)
@@ -207,7 +207,7 @@ def run_recurrent_layer(runtime, view, metas, vec, hidden: Sequence[float], laye
         view("ssm_out.weight"), metas[f"{p}.ssm_out.weight"], gdn.flatten(gated)
     )
     residual = [float(hidden[i]) + attn_out[i] for i in range(HIDDEN)]
-    post = gdn.rms_norm(residual, vec("post_attention_norm.weight"))
+    post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)
     ffn = run_ffn(runtime, view, metas, p, post)
     return [residual[i] + ffn[i] for i in range(HIDDEN)]
 
@@ -216,7 +216,7 @@ def run_full_attention_layer(
     runtime, view, metas, vec, hidden: Sequence[float], layer: int
 ) -> tuple[list[float], int]:
     p = f"blk.{layer}"
-    x = gdn.rms_norm(hidden, vec("attn_norm.weight"))
+    x = runtime.rms_norm(hidden, vec("attn_norm.weight"), eps=gdn.RMS_EPS)
 
     # q/k/v are all folded from the same 5120-wide activation. The explicit
     # Prism sign vector is width-keyed, so a single transformed+Q8 activation is
@@ -233,8 +233,8 @@ def run_full_attention_layer(
     )
 
     q, gate = attn.split_q_gate(qg)
-    q_norm = attn.rms_norm_heads(q, attn.N_HEAD, vec("attn_q_norm.weight"))
-    k_norm = attn.rms_norm_heads(k, attn.N_HEAD_KV, vec("attn_k_norm.weight"))
+    q_norm = runtime.rms_norm(q, vec("attn_q_norm.weight"), rows=attn.N_HEAD, eps=attn.RMS_EPS)
+    k_norm = runtime.rms_norm(k, vec("attn_k_norm.weight"), rows=attn.N_HEAD_KV, eps=attn.RMS_EPS)
 
     # Position 0 RoPE is identity. Default Prism/llama.cpp cache storage is F16.
     # With one key, softmax is exactly 1 and the pre-gate attention output is
@@ -249,7 +249,7 @@ def run_full_attention_layer(
         view("attn_output.weight"), metas[f"{p}.attn_output.weight"], gated
     )
     residual = [float(hidden[i]) + attn_out[i] for i in range(HIDDEN)]
-    post = gdn.rms_norm(residual, vec("post_attention_norm.weight"))
+    post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)
     ffn = run_ffn(runtime, view, metas, p, post)
     return [residual[i] + ffn[i] for i in range(HIDDEN)], (len(k_cache) + len(v_cache)) * 2
 
@@ -449,7 +449,7 @@ def execute(
     norm_w = read_f32_global(model, tensors["output_norm.weight"])
 
     # Isolated final-head semantic lane.
-    local_norm = gdn.rms_norm(reference["post_ffn-63"], norm_w)
+    local_norm = runtime.rms_norm(reference["post_ffn-63"], norm_w, eps=gdn.RMS_EPS)
     local_norm_m = metrics(reference["result_norm"], local_norm)
     local_logits = stream_lowbit_logits(
         model, tensors["output.weight"], runtime, reference["result_norm"]
@@ -457,7 +457,7 @@ def execute(
     local_logits_m = metrics(reference["result_output"], local_logits)
 
     # Actual free-running result.
-    free_norm = gdn.rms_norm(free_hidden, norm_w)
+    free_norm = runtime.rms_norm(free_hidden, norm_w, eps=gdn.RMS_EPS)
     free_norm_m = metrics(reference["result_norm"], free_norm)
     free_logits = stream_lowbit_logits(
         model, tensors["output.weight"], runtime, free_norm

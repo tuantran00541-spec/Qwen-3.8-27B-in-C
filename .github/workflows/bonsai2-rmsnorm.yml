@@ -6,6 +6,9 @@ on:
       - test/bonsai2-27b
     paths:
       - qwen38/test_bonsai2_native_rmsnorm.py
+      - qwen38/bonsai2_full64_one_token.py
+      - qwen38/bonsai2_two_token.py
+      - qwen38/bonsai2_prompt_spike.py
       - qwen38/bonsai2_quant_runtime.py
       - qwen38/bonsai2_quant_dot_avx2.c
       - qwen38/bonsai2_persistent_pool_portable.c

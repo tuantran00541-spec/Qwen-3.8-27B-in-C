@@ -149,7 +149,7 @@ def ffn(runtime, view, metas, prefix: str, x: Sequence[float]) -> list[float]:
 def recurrent_step(runtime, state_lib, state, prev_qkv, view, metas, vec,
                    hidden: Sequence[float], layer: int, token_index: int):
     p = f"blk.{layer}"
-    x = gdn.rms_norm(hidden, vec("attn_norm.weight"))
+    x = runtime.rms_norm(hidden, vec("attn_norm.weight"), eps=gdn.RMS_EPS)
     prepared = runtime.prepare_activation(f"{p}.attn_qkv.weight", x)
     qkv = runtime.matvec_prepared(
         view("attn_qkv.weight"), metas[f"{p}.attn_qkv.weight"], prepared
@@ -184,7 +184,7 @@ def recurrent_step(runtime, state_lib, state, prev_qkv, view, metas, vec,
     gated = runtime.gdn_norm_gate(core, norm_w, z, eps=gdn.RMS_EPS)
     linear = runtime.matvec(view("ssm_out.weight"), metas[f"{p}.ssm_out.weight"], gated)
     residual = [addf(hidden[i], linear[i]) for i in range(gdn.HIDDEN)]
-    post = gdn.rms_norm(residual, vec("post_attention_norm.weight"))
+    post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)
     fo = ffn(runtime, view, metas, p, post)
     return [addf(residual[i], fo[i]) for i in range(gdn.HIDDEN)], qkv
 
@@ -198,20 +198,20 @@ def softmax2(a: float, b: float) -> tuple[float, float]:
 
 def full_attn_step(runtime, cache, view, metas, vec, hidden: Sequence[float], layer: int, token_index: int):
     p = f"blk.{layer}"
-    x = gdn.rms_norm(hidden, vec("attn_norm.weight"))
+    x = runtime.rms_norm(hidden, vec("attn_norm.weight"), eps=gdn.RMS_EPS)
     prepared = runtime.prepare_activation(f"{p}.attn_q.weight", x)
     qg = runtime.matvec_prepared(
         view("attn_q.weight"), metas[f"{p}.attn_q.weight"], prepared
     )
     q, gate = attn.split_q_gate(qg)
-    q = attn.rms_norm_heads(q, attn.N_HEAD, vec("attn_q_norm.weight"))
+    q = runtime.rms_norm(q, vec("attn_q_norm.weight"), rows=attn.N_HEAD, eps=attn.RMS_EPS)
     k = runtime.matvec_prepared(
         view("attn_k.weight"), metas[f"{p}.attn_k.weight"], prepared
     )
     v = runtime.matvec_prepared(
         view("attn_v.weight"), metas[f"{p}.attn_v.weight"], prepared
     )
-    k = attn.rms_norm_heads(k, attn.N_HEAD_KV, vec("attn_k_norm.weight"))
+    k = runtime.rms_norm(k, vec("attn_k_norm.weight"), rows=attn.N_HEAD_KV, eps=attn.RMS_EPS)
     q_rope = rope_text_neox(q, attn.N_HEAD, token_index)
     k_rope = rope_text_neox(k, attn.N_HEAD_KV, token_index)
     k_cache = attn.f16_roundtrip(k_rope); v_cache = attn.f16_roundtrip(v)
@@ -238,7 +238,7 @@ def full_attn_step(runtime, cache, view, metas, vec, hidden: Sequence[float], la
     gated = [mulf(pregate[i], gs[i]) for i in range(attn.Q_DIM)]
     ao = runtime.matvec(view("attn_output.weight"), metas[f"{p}.attn_output.weight"], gated)
     residual = [addf(hidden[i], ao[i]) for i in range(gdn.HIDDEN)]
-    post = gdn.rms_norm(residual, vec("post_attention_norm.weight"))
+    post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)
     fo = ffn(runtime, view, metas, p, post)
     final = [addf(residual[i], fo[i]) for i in range(gdn.HIDDEN)]
     return final, {"Qcur": q_rope, "Kcur": k_rope, "Vcur": v}
@@ -288,7 +288,7 @@ def execute(model: Path, native_lib: Path, state_lib_path: Path,
         reader_report=reader.report()
 
     tensors=directory.by_name(); normw=base.read_f32_global(model,tensors["output_norm.weight"])
-    result_norm=gdn.rms_norm(token1_final,normw)
+    result_norm=runtime.rms_norm(token1_final, normw, eps=gdn.RMS_EPS)
     logits=base.stream_lowbit_logits(model,tensors["output.weight"],runtime,result_norm)
     top10=base.topk(logits,10); token2=int(top10[0]["token"])
     ref_logits=ref["result_output"]; oracle_top10=base.topk(ref_logits,10)
