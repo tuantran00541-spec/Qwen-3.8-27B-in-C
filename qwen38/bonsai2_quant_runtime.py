@@ -8,6 +8,7 @@ wired only after these primitives pass real-weight gates.
 """
 from __future__ import annotations
 
+from array import array
 import ctypes
 import time
 from pathlib import Path
@@ -63,6 +64,7 @@ class Bonsai2NativeRuntime:
         if self.threads < 1 or self.threads > 64:
             raise ValueError("threads must be in [1,64]")
         self.pool = None
+        self._attention_cache: dict[int, dict[str, object]] = {}
 
         self.lib.qwen_quantize_q8_0_scalar.argtypes = [
             _C_FP, ctypes.c_size_t, _C_U8P, ctypes.c_size_t
@@ -111,6 +113,18 @@ class Bonsai2NativeRuntime:
             _C_FP, _C_FP, ctypes.c_size_t, _C_FP
         ]
         self.lib.qwen_bonsai2_residual_add_f32.restype = ctypes.c_int
+        self.lib.qwen_bonsai2_attention_core_f32.argtypes = [
+            _C_FP,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            _C_FP,
+            _C_FP,
+            ctypes.c_size_t,
+            ctypes.c_double,
+            _C_FP,
+        ]
+        self.lib.qwen_bonsai2_attention_core_f32.restype = ctypes.c_int
         self.lib.qwen_bonsai2_gdn_conv_silu_f32.argtypes = [
             _C_FP, _C_FP, ctypes.c_size_t, _C_FP, ctypes.c_size_t, _C_FP
         ]
@@ -211,6 +225,7 @@ class Bonsai2NativeRuntime:
             "lookup_dequantize",
             "swiglu",
             "attention_gate",
+            "attention_core",
             "residual_add",
             "gdn_conv_silu",
             "gdn_norm_gate",
@@ -333,6 +348,103 @@ class Bonsai2NativeRuntime:
             raise RuntimeError(f"native Bonsai 2 attention gate failed rc={rc}")
         started = time.perf_counter()
         result = [float(out[i]) for i in range(n)]
+        self._record_timing("output_copy", started)
+        return result
+
+    @staticmethod
+    def _array_f32_ptr(buf: array):
+        return (ctypes.c_float * len(buf)).from_buffer(buf)
+
+    def _sync_attention_cache(
+        self,
+        layer: int,
+        cache,
+        kv_dim: int,
+    ) -> tuple[array, array, int]:
+        n_ctx = len(cache["k"])
+        if n_ctx <= 0 or n_ctx != len(cache["v"]):
+            raise ValueError("attention K/V cache length mismatch")
+        newest_k = cache["k"][-1]
+        newest_v = cache["v"][-1]
+        if len(newest_k) != kv_dim or len(newest_v) != kv_dim:
+            raise ValueError("attention K/V cache width mismatch")
+
+        slot = self._attention_cache.get(int(layer))
+        if slot is None or int(slot["rows"]) != n_ctx - 1:
+            kflat = array("f")
+            vflat = array("f")
+            for row in cache["k"]:
+                if len(row) != kv_dim:
+                    raise ValueError("attention K cache width mismatch")
+                kflat.extend(map(float, row))
+            for row in cache["v"]:
+                if len(row) != kv_dim:
+                    raise ValueError("attention V cache width mismatch")
+                vflat.extend(map(float, row))
+            slot = {"k": kflat, "v": vflat, "rows": n_ctx}
+            self._attention_cache[int(layer)] = slot
+        else:
+            kflat = slot["k"]
+            vflat = slot["v"]
+            assert isinstance(kflat, array) and isinstance(vflat, array)
+            kflat.extend(map(float, newest_k))
+            vflat.extend(map(float, newest_v))
+            slot["rows"] = n_ctx
+
+        kflat = slot["k"]
+        vflat = slot["v"]
+        assert isinstance(kflat, array) and isinstance(vflat, array)
+        if len(kflat) != n_ctx * kv_dim or len(vflat) != n_ctx * kv_dim:
+            raise RuntimeError("native attention flat-cache bookkeeping mismatch")
+        return kflat, vflat, n_ctx
+
+    def attention_core(
+        self,
+        layer: int,
+        q: Sequence[float],
+        cache,
+        *,
+        q_heads: int,
+        kv_heads: int,
+        head_dim: int,
+        scale: float,
+    ) -> list[float]:
+        q_heads = int(q_heads)
+        kv_heads = int(kv_heads)
+        head_dim = int(head_dim)
+        if q_heads <= 0 or kv_heads <= 0 or head_dim <= 0 or q_heads % kv_heads:
+            raise ValueError(
+                f"attention geometry q_heads={q_heads} kv_heads={kv_heads} "
+                f"head_dim={head_dim}"
+            )
+        q_dim = q_heads * head_dim
+        kv_dim = kv_heads * head_dim
+        if len(q) != q_dim:
+            raise ValueError(f"attention Q width={len(q)} expected={q_dim}")
+
+        qbuf = array("f", map(float, q))
+        kflat, vflat, n_ctx = self._sync_attention_cache(
+            int(layer), cache, kv_dim
+        )
+        out = (ctypes.c_float * q_dim)()
+        started = time.perf_counter()
+        rc = self.lib.qwen_bonsai2_attention_core_f32(
+            self._array_f32_ptr(qbuf),
+            q_heads,
+            kv_heads,
+            head_dim,
+            self._array_f32_ptr(kflat),
+            self._array_f32_ptr(vflat),
+            n_ctx,
+            ctypes.c_double(float(scale)),
+            out,
+        )
+        self._record_timing("attention_core", started)
+        if rc != 0:
+            raise RuntimeError(f"native Bonsai 2 attention core failed rc={rc}")
+
+        started = time.perf_counter()
+        result = [float(out[i]) for i in range(q_dim)]
         self._record_timing("output_copy", started)
         return result
 
@@ -631,6 +743,7 @@ class Bonsai2NativeRuntime:
 
 
     def close(self) -> None:
+        self._attention_cache.clear()
         if self.pool:
             self.lib.qwen_bonsai2_pool_destroy(self.pool)
             self.pool = None

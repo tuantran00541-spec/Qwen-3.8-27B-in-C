@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "gguf_quant_dot_avx2.c"
+#include "attention_core_exact.c"
 
 #define QWEN_QK_PQ2_0 128
 #define QWEN_BLOCK_PQ2_0 34
@@ -34,6 +35,21 @@
 #define QWEN_EXPORT
 #endif
 #endif
+
+QWEN_EXPORT int qwen_bonsai2_attention_core_f32(
+        const float *q,
+        size_t q_heads,
+        size_t kv_heads,
+        size_t head_dim,
+        const float *k_cache,
+        const float *v_cache,
+        size_t n_ctx,
+        double scale,
+        float *out) {
+    return qwen_attention_core_f32_exact(
+        q, q_heads, kv_heads, head_dim,
+        k_cache, v_cache, n_ctx, scale, out);
+}
 
 QWEN_EXPORT int qwen_bonsai2_swiglu_f32(
         const float *gate, const float *up, size_t n, float *out) {

@@ -221,34 +221,15 @@ def full_attention_step(
 
     cache["k"].append(attn.f16_roundtrip(k_rope))
     cache["v"].append(attn.f16_roundtrip(v))
-    n_ctx = len(cache["k"])
-
-    q_heads = attn.split_heads(q_rope, attn.N_HEAD)
-    pregate: list[float] = []
-    for q_index in range(attn.N_HEAD):
-        kv_head = q_index // attn.GQA_REPEAT
-        qv = q_heads[q_index]
-        scores: list[float] = []
-        for token_index in range(n_ctx):
-            kh = cache["k"][token_index][
-                kv_head * attn.HEAD_DIM : (kv_head + 1) * attn.HEAD_DIM
-            ]
-            scores.append(
-                f32(
-                    math.fsum(
-                        float(qv[d]) * float(kh[d])
-                        for d in range(attn.HEAD_DIM)
-                    )
-                    * t2.SCALE_ATTN
-                )
-            )
-        probs = softmax_many(scores)
-        for d in range(attn.HEAD_DIM):
-            acc = f32(0.0)
-            for token_index in range(n_ctx):
-                value = cache["v"][token_index][kv_head * attn.HEAD_DIM + d]
-                acc = addf(acc, mulf(probs[token_index], value))
-            pregate.append(acc)
+    pregate = runtime.attention_core(
+        layer,
+        q_rope,
+        cache,
+        q_heads=attn.N_HEAD,
+        kv_heads=attn.N_HEAD_KV,
+        head_dim=attn.HEAD_DIM,
+        scale=t2.SCALE_ATTN,
+    )
 
     gated = runtime.attention_sigmoid_mul(pregate, gate)
     attn_out = runtime.matvec(

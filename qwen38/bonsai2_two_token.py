@@ -217,22 +217,15 @@ def full_attn_step(runtime, cache, view, metas, vec, hidden: Sequence[float], la
     k_cache = attn.f16_roundtrip(k_rope); v_cache = attn.f16_roundtrip(v)
     cache["k"].append(k_cache); cache["v"].append(v_cache)
 
-    qh = attn.split_heads(q_rope, attn.N_HEAD)
-    pregate = []
-    for qidx in range(attn.N_HEAD):
-        kvh = qidx // attn.GQA_REPEAT
-        qv = qh[qidx]
-        if token_index == 0:
-            pregate.extend(cache["v"][0][kvh*attn.HEAD_DIM:(kvh+1)*attn.HEAD_DIM])
-            continue
-        kh0 = cache["k"][0][kvh*attn.HEAD_DIM:(kvh+1)*attn.HEAD_DIM]
-        kh1 = cache["k"][1][kvh*attn.HEAD_DIM:(kvh+1)*attn.HEAD_DIM]
-        s0 = f32(math.fsum(float(qv[d])*float(kh0[d]) for d in range(attn.HEAD_DIM)) * SCALE_ATTN)
-        s1 = f32(math.fsum(float(qv[d])*float(kh1[d]) for d in range(attn.HEAD_DIM)) * SCALE_ATTN)
-        p0,p1 = softmax2(s0,s1)
-        vv0 = cache["v"][0][kvh*attn.HEAD_DIM:(kvh+1)*attn.HEAD_DIM]
-        vv1 = cache["v"][1][kvh*attn.HEAD_DIM:(kvh+1)*attn.HEAD_DIM]
-        pregate.extend(addf(mulf(p0,vv0[d]), mulf(p1,vv1[d])) for d in range(attn.HEAD_DIM))
+    pregate = runtime.attention_core(
+        layer,
+        q_rope,
+        cache,
+        q_heads=attn.N_HEAD,
+        kv_heads=attn.N_HEAD_KV,
+        head_dim=attn.HEAD_DIM,
+        scale=SCALE_ATTN,
+    )
 
     gated = runtime.attention_sigmoid_mul(pregate, gate)
     ao = runtime.matvec(view("attn_output.weight"), metas[f"{p}.attn_output.weight"], gated)

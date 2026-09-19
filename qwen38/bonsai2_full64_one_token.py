@@ -237,11 +237,18 @@ def run_full_attention_layer(
     k_norm = runtime.rms_norm(k, vec("attn_k_norm.weight"), rows=attn.N_HEAD_KV, eps=attn.RMS_EPS)
 
     # Position 0 RoPE is identity. Default Prism/llama.cpp cache storage is F16.
-    # With one key, softmax is exactly 1 and the pre-gate attention output is
-    # simply the GQA-expanded cached V value.
     k_cache = attn.f16_roundtrip(k_norm)
     v_cache = attn.f16_roundtrip(v)
-    pregate = attn.gqa_one_key_attention(v_cache)
+    cache = {"k": [k_cache], "v": [v_cache]}
+    pregate = runtime.attention_core(
+        layer,
+        q_norm,
+        cache,
+        q_heads=attn.N_HEAD,
+        kv_heads=attn.N_HEAD_KV,
+        head_dim=attn.HEAD_DIM,
+        scale=1.0 / math.sqrt(attn.HEAD_DIM),
+    )
     gated = runtime.attention_sigmoid_mul(pregate, gate)
 
     attn_out = runtime.matvec(
