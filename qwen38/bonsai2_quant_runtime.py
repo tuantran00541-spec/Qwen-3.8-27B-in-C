@@ -103,6 +103,10 @@ class Bonsai2NativeRuntime:
             _C_FP, _C_FP, ctypes.c_size_t, _C_FP
         ]
         self.lib.qwen_bonsai2_swiglu_f32.restype = ctypes.c_int
+        self.lib.qwen_bonsai2_attention_gate_f32.argtypes = [
+            _C_FP, _C_FP, ctypes.c_size_t, _C_FP
+        ]
+        self.lib.qwen_bonsai2_attention_gate_f32.restype = ctypes.c_int
         self.lib.qwen_bonsai2_gdn_conv_silu_f32.argtypes = [
             _C_FP, _C_FP, ctypes.c_size_t, _C_FP, ctypes.c_size_t, _C_FP
         ]
@@ -202,6 +206,7 @@ class Bonsai2NativeRuntime:
             "bf16_matvec",
             "lookup_dequantize",
             "swiglu",
+            "attention_gate",
             "gdn_conv_silu",
             "gdn_norm_gate",
             "rms_norm",
@@ -294,6 +299,33 @@ class Bonsai2NativeRuntime:
         self._record_timing("swiglu", started)
         if rc != 0:
             raise RuntimeError(f"native Bonsai 2 SwiGLU failed rc={rc}")
+        started = time.perf_counter()
+        result = [float(out[i]) for i in range(n)]
+        self._record_timing("output_copy", started)
+        return result
+
+    def attention_sigmoid_mul(
+        self,
+        pregate: Sequence[float],
+        gate: Sequence[float],
+    ) -> list[float]:
+        if len(pregate) != len(gate):
+            raise ValueError(
+                f"attention gate shape mismatch pregate={len(pregate)} gate={len(gate)}"
+            )
+        n = len(pregate)
+        if n == 0:
+            return []
+        pregate_arr = (ctypes.c_float * n)(*map(float, pregate))
+        gate_arr = (ctypes.c_float * n)(*map(float, gate))
+        out = (ctypes.c_float * n)()
+        started = time.perf_counter()
+        rc = self.lib.qwen_bonsai2_attention_gate_f32(
+            pregate_arr, gate_arr, n, out
+        )
+        self._record_timing("attention_gate", started)
+        if rc != 0:
+            raise RuntimeError(f"native Bonsai 2 attention gate failed rc={rc}")
         started = time.perf_counter()
         result = [float(out[i]) for i in range(n)]
         self._record_timing("output_copy", started)

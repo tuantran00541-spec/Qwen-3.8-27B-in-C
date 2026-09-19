@@ -250,11 +250,7 @@ def full_attention_step(
                 acc = addf(acc, mulf(probs[token_index], value))
             pregate.append(acc)
 
-    gate_sigmoid = [exact.sigmoid_f32(value) for value in gate]
-    gated = [
-        mulf(pregate[i], gate_sigmoid[i])
-        for i in range(attn.Q_DIM)
-    ]
+    gated = runtime.attention_sigmoid_mul(pregate, gate)
     attn_out = runtime.matvec(
         view("attn_output.weight"), metas[f"{p}.attn_output.weight"], gated
     )

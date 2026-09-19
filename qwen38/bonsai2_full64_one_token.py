@@ -242,8 +242,7 @@ def run_full_attention_layer(
     k_cache = attn.f16_roundtrip(k_norm)
     v_cache = attn.f16_roundtrip(v)
     pregate = attn.gqa_one_key_attention(v_cache)
-    gate_sigmoid = [gdn.sigmoid(t) for t in gate]
-    gated = [pregate[i] * gate_sigmoid[i] for i in range(attn.Q_DIM)]
+    gated = runtime.attention_sigmoid_mul(pregate, gate)
 
     attn_out = runtime.matvec(
         view("attn_output.weight"), metas[f"{p}.attn_output.weight"], gated

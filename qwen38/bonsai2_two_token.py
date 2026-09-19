@@ -234,8 +234,7 @@ def full_attn_step(runtime, cache, view, metas, vec, hidden: Sequence[float], la
         vv1 = cache["v"][1][kvh*attn.HEAD_DIM:(kvh+1)*attn.HEAD_DIM]
         pregate.extend(addf(mulf(p0,vv0[d]), mulf(p1,vv1[d])) for d in range(attn.HEAD_DIM))
 
-    gs = [exact.sigmoid_f32(vv) for vv in gate]
-    gated = [mulf(pregate[i], gs[i]) for i in range(attn.Q_DIM)]
+    gated = runtime.attention_sigmoid_mul(pregate, gate)
     ao = runtime.matvec(view("attn_output.weight"), metas[f"{p}.attn_output.weight"], gated)
     residual = [addf(hidden[i], ao[i]) for i in range(gdn.HIDDEN)]
     post = runtime.rms_norm(residual, vec("post_attention_norm.weight"), eps=gdn.RMS_EPS)

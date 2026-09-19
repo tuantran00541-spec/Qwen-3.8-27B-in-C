@@ -76,6 +76,19 @@ static inline float qwen_bonsai2_silu_f32_exact(float x) {
         x, qwen_bonsai2_sigmoid_f32_exact(x));
 }
 
+QWEN_EXPORT int qwen_bonsai2_attention_gate_f32(
+        const float *pregate,
+        const float *gate,
+        size_t n,
+        float *out) {
+    if (!pregate || !gate || !out || n == 0) return -1;
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = qwen_bonsai2_round_mul_f32(
+            pregate[i], qwen_bonsai2_sigmoid_f32_exact(gate[i]));
+    }
+    return 0;
+}
+
 QWEN_EXPORT int qwen_bonsai2_gdn_conv_silu_f32(
         const float *qkv,
         const float *history,
