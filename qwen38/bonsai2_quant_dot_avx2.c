@@ -841,6 +841,42 @@ static inline int32_t qwen_bonsai2_ptq1_dot_trits8_madd_sse(
  * one 128-weight block. Integer pair sums may be regrouped freely here:
  * q is {-1,0,+1}, activation is int8, and the complete 32-term dot stays far
  * inside int32. Floating-point scale/accumulation order is untouched. */
+static inline __m256i qwen_bonsai2_ptq1_trits16_from_raw_avx2(
+        __m256i raw16, uint16_t pow3) {
+    __m256i v = _mm256_mullo_epi16(
+        raw16, _mm256_set1_epi16((short)pow3));
+    v = _mm256_and_si256(v, _mm256_set1_epi16(0x00ff));
+    v = _mm256_mullo_epi16(v, _mm256_set1_epi16(3));
+    __m256i q = _mm256_srli_epi16(v, 8);
+    return _mm256_sub_epi16(q, _mm256_set1_epi16(1));
+}
+
+static inline __m128i qwen_bonsai2_ptq1_trits8_from_raw_sse(
+        __m128i raw16, uint16_t pow3) {
+    __m128i v = _mm_mullo_epi16(
+        raw16, _mm_set1_epi16((short)pow3));
+    v = _mm_and_si128(v, _mm_set1_epi16(0x00ff));
+    v = _mm_mullo_epi16(v, _mm_set1_epi16(3));
+    __m128i q = _mm_srli_epi16(v, 8);
+    return _mm_sub_epi16(q, _mm_set1_epi16(1));
+}
+
+static inline __m256i qwen_bonsai2_ptq1_madd16_decoded_avx2(
+        __m256i q16, const int8_t *activation) {
+    const __m128i a8 =
+        _mm_loadu_si128((const __m128i *)activation);
+    const __m256i a16 = _mm256_cvtepi8_epi16(a8);
+    return _mm256_madd_epi16(q16, a16);
+}
+
+static inline __m128i qwen_bonsai2_ptq1_madd8_decoded_sse(
+        __m128i q16, const int8_t *activation) {
+    const __m128i a8 =
+        _mm_loadl_epi64((const __m128i *)activation);
+    const __m128i a16 = _mm_cvtepi8_epi16(a8);
+    return _mm_madd_epi16(q16, a16);
+}
+
 static inline __m256i qwen_bonsai2_ptq1_pairs16_from_raw_avx2(
         __m256i raw16, uint16_t pow3, const int8_t *activation) {
     __m256i v = _mm256_mullo_epi16(
@@ -1050,6 +1086,217 @@ static int qwen_bonsai2_matvec_ptq1_0_q8_0_cached_scales(
     return 0;
 }
 
+
+QWEN_EXPORT int qwen_bonsai2_matvec_many_ptq1_0_q8_0_packed(
+        const uint8_t *weights,
+        size_t weights_bytes,
+        size_t rows,
+        size_t n,
+        const uint8_t *activations,
+        size_t activation_bytes_each,
+        size_t n_vec,
+        float *out) {
+    if (!weights || !activations || !out ||
+        rows == 0 || n == 0 || n_vec == 0 ||
+        n % QWEN_QK_PTQ1_0 != 0) {
+        return -1;
+    }
+
+    const size_t weight_blocks = n / QWEN_QK_PTQ1_0;
+    const size_t row_bytes =
+        weight_blocks * QWEN_BLOCK_PTQ1_0;
+    const size_t q8_blocks = n / QWEN_QK8_0;
+    const size_t activation_bytes =
+        q8_blocks * QWEN_BLOCK_Q8_0;
+    if (weights_bytes != rows * row_bytes) return -2;
+    if (activation_bytes_each != activation_bytes) return -3;
+
+    float *activation_scales = (float *)malloc(
+        n_vec * q8_blocks * sizeof(float));
+    float *sums = (float *)malloc(n_vec * sizeof(float));
+    if (!activation_scales || !sums) {
+        free(sums);
+        free(activation_scales);
+        return -4;
+    }
+
+    for (size_t v = 0; v < n_vec; ++v) {
+        const uint8_t *activation =
+            activations + v * activation_bytes_each;
+        float *scales =
+            activation_scales + v * q8_blocks;
+        for (size_t ib = 0; ib < q8_blocks; ++ib) {
+            const uint8_t *ab =
+                activation + ib * QWEN_BLOCK_Q8_0;
+            scales[ib] =
+                qwen_f16_to_f32(qwen_load_u16_le(ab));
+        }
+    }
+
+    static const uint16_t pow3[5] = {1, 3, 9, 27, 81};
+    int8_t lut[256][5];
+    qwen_bonsai2_ptq1_lut(lut);
+
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t v = 0; v < n_vec; ++v) {
+            sums[v] = 0.0f;
+        }
+        const uint8_t *wrow = weights + r * row_bytes;
+
+        for (size_t ib = 0; ib < weight_blocks; ++ib) {
+            const uint8_t *xb =
+                wrow + ib * QWEN_BLOCK_PTQ1_0;
+            const uint8_t *qs = xb;
+            const uint8_t *qh = xb + 24;
+
+            const __m128i packed16 =
+                _mm_loadu_si128((const __m128i *)qs);
+            const __m256i raw16 =
+                _mm256_cvtepu8_epi16(packed16);
+            const __m128i packed8 =
+                _mm_loadl_epi64(
+                    (const __m128i *)(qs + 16));
+            const __m128i raw8 =
+                _mm_cvtepu8_epi16(packed8);
+
+            const __m256i q160 =
+                qwen_bonsai2_ptq1_trits16_from_raw_avx2(
+                    raw16, pow3[0]);
+            const __m256i q161 =
+                qwen_bonsai2_ptq1_trits16_from_raw_avx2(
+                    raw16, pow3[1]);
+            const __m256i q162 =
+                qwen_bonsai2_ptq1_trits16_from_raw_avx2(
+                    raw16, pow3[2]);
+            const __m256i q163 =
+                qwen_bonsai2_ptq1_trits16_from_raw_avx2(
+                    raw16, pow3[3]);
+            const __m256i q164 =
+                qwen_bonsai2_ptq1_trits16_from_raw_avx2(
+                    raw16, pow3[4]);
+
+            const __m128i q80 =
+                qwen_bonsai2_ptq1_trits8_from_raw_sse(
+                    raw8, pow3[0]);
+            const __m128i q81 =
+                qwen_bonsai2_ptq1_trits8_from_raw_sse(
+                    raw8, pow3[1]);
+            const __m128i q82 =
+                qwen_bonsai2_ptq1_trits8_from_raw_sse(
+                    raw8, pow3[2]);
+            const __m128i q83 =
+                qwen_bonsai2_ptq1_trits8_from_raw_sse(
+                    raw8, pow3[3]);
+            const __m128i q84 =
+                qwen_bonsai2_ptq1_trits8_from_raw_sse(
+                    raw8, pow3[4]);
+
+            int8_t qh8[8];
+            for (int nn = 0; nn < 4; ++nn) {
+                qh8[nn * 2 + 0] = lut[qh[0]][nn];
+                qh8[nn * 2 + 1] = lut[qh[1]][nn];
+            }
+            const __m128i qh_raw =
+                _mm_loadl_epi64((const __m128i *)qh8);
+            const __m128i qh16 =
+                _mm_cvtepi8_epi16(qh_raw);
+
+            const float d0 =
+                qwen_f16_to_f32(qwen_load_u16_le(xb + 26));
+
+            for (size_t v = 0; v < n_vec; ++v) {
+                const uint8_t *yb =
+                    activations + v * activation_bytes_each +
+                    ib * 4 * QWEN_BLOCK_Q8_0;
+                const int8_t *a0 =
+                    (const int8_t *)(
+                        yb + 0 * QWEN_BLOCK_Q8_0 + 2);
+                const int8_t *a1 =
+                    (const int8_t *)(
+                        yb + 1 * QWEN_BLOCK_Q8_0 + 2);
+                const int8_t *a2 =
+                    (const int8_t *)(
+                        yb + 2 * QWEN_BLOCK_Q8_0 + 2);
+                const int8_t *a3 =
+                    (const int8_t *)(
+                        yb + 3 * QWEN_BLOCK_Q8_0 + 2);
+                const float *scales =
+                    activation_scales +
+                    v * q8_blocks + ib * 4;
+
+                int32_t dots[4];
+                const __m256i d00 =
+                    qwen_bonsai2_ptq1_madd16_decoded_avx2(
+                        q160, a0 + 0);
+                const __m256i d01 =
+                    qwen_bonsai2_ptq1_madd16_decoded_avx2(
+                        q161, a0 + 16);
+                dots[0] = qwen_hsum8_i32(
+                    _mm256_add_epi32(d00, d01));
+
+                const __m256i d10 =
+                    qwen_bonsai2_ptq1_madd16_decoded_avx2(
+                        q162, a1 + 0);
+                const __m256i d11 =
+                    qwen_bonsai2_ptq1_madd16_decoded_avx2(
+                        q163, a1 + 16);
+                dots[1] = qwen_hsum8_i32(
+                    _mm256_add_epi32(d10, d11));
+
+                const __m256i d20 =
+                    qwen_bonsai2_ptq1_madd16_decoded_avx2(
+                        q164, a2 + 0);
+                const __m128i d21 =
+                    qwen_bonsai2_ptq1_madd8_decoded_sse(
+                        q80, a2 + 16);
+                const __m128i d22 =
+                    qwen_bonsai2_ptq1_madd8_decoded_sse(
+                        q81, a2 + 24);
+                dots[2] =
+                    qwen_hsum8_i32(d20) +
+                    qwen_bonsai2_hsum4_i32_sse(
+                        _mm_add_epi32(d21, d22));
+
+                const __m128i d30 =
+                    qwen_bonsai2_ptq1_madd8_decoded_sse(
+                        q82, a3 + 0);
+                const __m128i d31 =
+                    qwen_bonsai2_ptq1_madd8_decoded_sse(
+                        q83, a3 + 8);
+                const __m128i d32 =
+                    qwen_bonsai2_ptq1_madd8_decoded_sse(
+                        q84, a3 + 16);
+                const __m128i ah_raw =
+                    _mm_loadl_epi64(
+                        (const __m128i *)(a3 + 24));
+                const __m128i ah16 =
+                    _mm_cvtepi8_epi16(ah_raw);
+                const __m128i dh =
+                    _mm_madd_epi16(qh16, ah16);
+                dots[3] =
+                    qwen_bonsai2_hsum4_i32_sse(
+                        _mm_add_epi32(
+                            _mm_add_epi32(d30, d31),
+                            d32)) +
+                    qwen_bonsai2_hsum4_i32_sse(dh);
+
+                float sumi = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    sumi += scales[k] * (float)dots[k];
+                }
+                sums[v] += d0 * sumi;
+            }
+        }
+
+        for (size_t v = 0; v < n_vec; ++v) {
+            out[v * rows + r] = sums[v];
+        }
+    }
+
+    free(sums);
+    free(activation_scales);
+    return 0;
+}
 
 QWEN_EXPORT int qwen_bonsai2_matvec_many_ptq1_0_q8_0(
         const uint8_t *weights,
