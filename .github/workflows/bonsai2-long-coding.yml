@@ -74,20 +74,20 @@ jobs:
           set -euxo pipefail
           mkdir -p work/bonsai2-coding/k3
           PROMPT="$(cat <<'EOF'
-Write valid Python source code only, with no Markdown fences and no prose outside the code.
-Implement:
-    merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]
-Requirements:
-- Return [] for empty input.
-- Normalize reversed endpoints, so (5, 2) is treated as (2, 5).
-- Sort by start position.
-- Merge overlapping intervals and intervals that touch at an endpoint.
-- Do not mutate the input list.
-- Include a concise docstring and type hints.
-- Under if __name__ == "__main__": include at least six assert-based tests covering empty input, one interval, overlap, touching, disjoint intervals, reversed endpoints, and a mixed case.
-The file must run successfully with Python 3.12.
-EOF
-)"
+          Write valid Python source code only, with no Markdown fences and no prose outside the code.
+          Implement:
+              merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]
+          Requirements:
+          - Return [] for empty input.
+          - Normalize reversed endpoints, so (5, 2) is treated as (2, 5).
+          - Sort by start position.
+          - Merge overlapping intervals and intervals that touch at an endpoint.
+          - Do not mutate the input list.
+          - Include a concise docstring and type hints.
+          - Under if __name__ == "__main__": include at least six assert-based tests covering empty input, one interval, overlap, touching, disjoint intervals, reversed endpoints, and a mixed case.
+          The file must run successfully with Python 3.12.
+          EOF
+          )"
           /usr/bin/time -v -o work/bonsai2-coding/time.txt \
             python -u qwen38/bonsai2_prompt_spike.py \
               --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
