@@ -49,6 +49,12 @@ struct qwen_bonsai2_pool {
     size_t activation_bytes;
     float *out;
 
+    size_t scratch_floats;
+    float *scratch0;
+    float *scratch1;
+    size_t scratch_q8_bytes;
+    uint8_t *scratch_q8;
+
     uint64_t calls;
 };
 
@@ -123,12 +129,32 @@ QWEN_EXPORT void *qwen_bonsai2_pool_create(int n_threads, size_t max_rows) {
     if (!p) return NULL;
     p->n_threads = n_threads;
     p->max_rows = max_rows;
+    p->scratch_floats = max_rows;
+    p->scratch_q8_bytes =
+        ((max_rows + 31u) / 32u) * QWEN_BLOCK_Q8_0;
+    p->scratch0 = (float *)malloc(max_rows * sizeof(float));
+    p->scratch1 = (float *)malloc(max_rows * sizeof(float));
+    p->scratch_q8 = (uint8_t *)malloc(p->scratch_q8_bytes);
+    if (!p->scratch0 || !p->scratch1 || !p->scratch_q8) {
+        free(p->scratch_q8);
+        free(p->scratch1);
+        free(p->scratch0);
+        free(p);
+        return NULL;
+    }
 
     if (qwen_mutex_init(&p->mutex) != 0) {
+        free(p->scratch_q8);
+        free(p->scratch1);
+        free(p->scratch0);
         free(p); return NULL;
     }
     if (qwen_cond_init(&p->work_cond) != 0) {
-        qwen_mutex_destroy(&p->mutex); free(p); return NULL;
+        qwen_mutex_destroy(&p->mutex);
+        free(p->scratch_q8);
+        free(p->scratch1);
+        free(p->scratch0);
+        free(p); return NULL;
     }
     if (qwen_cond_init(&p->done_cond) != 0) {
         qwen_cond_destroy(&p->work_cond);
@@ -142,6 +168,9 @@ QWEN_EXPORT void *qwen_bonsai2_pool_create(int n_threads, size_t max_rows) {
         qwen_cond_destroy(&p->done_cond);
         qwen_cond_destroy(&p->work_cond);
         qwen_mutex_destroy(&p->mutex);
+        free(p->scratch_q8);
+        free(p->scratch1);
+        free(p->scratch0);
         free(p);
         return NULL;
     }
@@ -163,6 +192,9 @@ QWEN_EXPORT void *qwen_bonsai2_pool_create(int n_threads, size_t max_rows) {
             qwen_cond_destroy(&p->done_cond);
             qwen_cond_destroy(&p->work_cond);
             qwen_mutex_destroy(&p->mutex);
+            free(p->scratch_q8);
+            free(p->scratch1);
+            free(p->scratch0);
             free(p);
             return NULL;
         }
@@ -183,6 +215,9 @@ QWEN_EXPORT void qwen_bonsai2_pool_destroy(void *opaque) {
         }
     }
     free(p->workers);
+    free(p->scratch_q8);
+    free(p->scratch1);
+    free(p->scratch0);
     qwen_cond_destroy(&p->done_cond);
     qwen_cond_destroy(&p->work_cond);
     qwen_mutex_destroy(&p->mutex);
@@ -262,6 +297,90 @@ QWEN_EXPORT int qwen_bonsai2_pool_matvec_pq2_0(
         opaque, QWEN_BONSAI2_KIND_PQ2,
         weights, weights_bytes, rows, n,
         activation, activation_bytes, out);
+}
+
+QWEN_EXPORT int qwen_bonsai2_pool_ffn_ptq1_0(
+        void *opaque,
+        const float *x,
+        size_t hidden,
+        size_t intermediate,
+        const uint8_t *gate_weights,
+        size_t gate_bytes,
+        const uint8_t *up_weights,
+        size_t up_bytes,
+        const uint8_t *down_weights,
+        size_t down_bytes,
+        size_t block_size,
+        const int8_t *sign_hidden,
+        const int8_t *sign_intermediate,
+        float *out) {
+    qwen_bonsai2_pool *p = (qwen_bonsai2_pool *)opaque;
+    if (!p || !x || !gate_weights || !up_weights || !down_weights || !out) {
+        return -1;
+    }
+    if (hidden == 0 || intermediate == 0 ||
+        hidden > p->scratch_floats || intermediate > p->scratch_floats ||
+        hidden % 128 != 0 || intermediate % 128 != 0 ||
+        block_size == 0) {
+        return -2;
+    }
+
+    const size_t gate_row = qwen_bonsai2_pool_row_bytes(
+        QWEN_BONSAI2_KIND_PTQ1, hidden);
+    const size_t down_row = qwen_bonsai2_pool_row_bytes(
+        QWEN_BONSAI2_KIND_PTQ1, intermediate);
+    if (gate_row == 0 || down_row == 0 ||
+        gate_bytes != intermediate * gate_row ||
+        up_bytes != intermediate * gate_row ||
+        down_bytes != hidden * down_row) {
+        return -3;
+    }
+
+    const size_t hidden_q8 = (hidden / 32u) * QWEN_BLOCK_Q8_0;
+    const size_t intermediate_q8 =
+        (intermediate / 32u) * QWEN_BLOCK_Q8_0;
+    if (hidden_q8 > p->scratch_q8_bytes ||
+        intermediate_q8 > p->scratch_q8_bytes) {
+        return -4;
+    }
+
+    memcpy(p->scratch0, x, hidden * sizeof(float));
+    int rc = qwen_bonsai2_fwht_blocks(
+        p->scratch0, hidden, block_size, sign_hidden);
+    if (rc != 0) return -10 + rc;
+    rc = qwen_quantize_q8_0_scalar(
+        p->scratch0, hidden, p->scratch_q8, hidden_q8);
+    if (rc != 0) return -20 + rc;
+
+    rc = qwen_bonsai2_pool_matvec(
+        p, QWEN_BONSAI2_KIND_PTQ1,
+        gate_weights, gate_bytes, intermediate, hidden,
+        p->scratch_q8, hidden_q8, p->scratch0);
+    if (rc != 0) return -30 + rc;
+    rc = qwen_bonsai2_pool_matvec(
+        p, QWEN_BONSAI2_KIND_PTQ1,
+        up_weights, up_bytes, intermediate, hidden,
+        p->scratch_q8, hidden_q8, p->scratch1);
+    if (rc != 0) return -40 + rc;
+
+    rc = qwen_bonsai2_swiglu_f32(
+        p->scratch0, p->scratch1, intermediate, p->scratch0);
+    if (rc != 0) return -50 + rc;
+
+    rc = qwen_bonsai2_fwht_blocks(
+        p->scratch0, intermediate, block_size, sign_intermediate);
+    if (rc != 0) return -60 + rc;
+    rc = qwen_quantize_q8_0_scalar(
+        p->scratch0, intermediate,
+        p->scratch_q8, intermediate_q8);
+    if (rc != 0) return -70 + rc;
+
+    rc = qwen_bonsai2_pool_matvec(
+        p, QWEN_BONSAI2_KIND_PTQ1,
+        down_weights, down_bytes, hidden, intermediate,
+        p->scratch_q8, intermediate_q8, out);
+    if (rc != 0) return -80 + rc;
+    return 0;
 }
 
 QWEN_EXPORT int qwen_bonsai2_pool_threads(void *opaque) {
