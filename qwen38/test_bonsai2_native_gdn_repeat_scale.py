@@ -80,28 +80,40 @@ def check_case(
 
 
 def check_execution_wiring() -> None:
-    expected = {
-        "bonsai2_two_token.py": (
-            "q48 = [mulf(vv, SCALE_GDN) for vv in repeat_k_heads(qn)]",
-            "k48 = repeat_k_heads(kn)",
-        ),
-        "bonsai2_prompt_spike.py": (
-            "q48 = [mulf(value, t2.SCALE_GDN) for value in t2.repeat_k_heads(qn)]",
-            "k48 = t2.repeat_k_heads(kn)",
-        ),
-    }
-    for filename, forbidden in expected.items():
-        source = (ROOT / "qwen38" / filename).read_text(encoding="utf-8")
-        calls = source.count("runtime.gdn_repeat_scale(")
-        if calls != 1:
-            raise AssertionError(
-                f"{filename}: native GDN repeat-scale calls={calls} expected=1"
-            )
-        leftovers = [needle for needle in forbidden if needle in source]
-        if leftovers:
-            raise AssertionError(
-                f"{filename}: Python GDN repeat-scale still wired: {leftovers}"
-            )
+    two_token = (ROOT / "qwen38" / "bonsai2_two_token.py").read_text(
+        encoding="utf-8"
+    )
+    prompt = (ROOT / "qwen38" / "bonsai2_prompt_spike.py").read_text(
+        encoding="utf-8"
+    )
+
+    if two_token.count("runtime.gdn_repeat_scale(") != 1:
+        raise AssertionError(
+            "bonsai2_two_token.py must keep one standalone exact repeat-scale call"
+        )
+
+    prompt_direct = prompt.count("runtime.gdn_repeat_scale(")
+    prompt_fused = prompt.count("runtime.recurrent_mid(")
+    if prompt_direct != 0 or prompt_fused != 1:
+        raise AssertionError(
+            "bonsai2_prompt_spike.py repeat-scale ownership must be fused into "
+            f"one recurrent_mid call; direct={prompt_direct} fused={prompt_fused}"
+        )
+
+    forbidden = (
+        "q48 = [mulf(vv, SCALE_GDN) for vv in repeat_k_heads(qn)]",
+        "k48 = repeat_k_heads(kn)",
+        "q48 = [mulf(value, t2.SCALE_GDN) for value in t2.repeat_k_heads(qn)]",
+        "k48 = t2.repeat_k_heads(kn)",
+    )
+    leftovers = [
+        needle for needle in forbidden
+        if needle in two_token or needle in prompt
+    ]
+    if leftovers:
+        raise AssertionError(
+            f"Python GDN repeat-scale still wired: {leftovers}"
+        )
 
 
 def main() -> None:
