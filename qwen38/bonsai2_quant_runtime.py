@@ -103,6 +103,15 @@ class Bonsai2NativeRuntime:
             _C_FP, _C_FP, ctypes.c_size_t, _C_FP
         ]
         self.lib.qwen_bonsai2_swiglu_f32.restype = ctypes.c_int
+        self.lib.qwen_bonsai2_gdn_conv_silu_f32.argtypes = [
+            _C_FP, _C_FP, ctypes.c_size_t, _C_FP, ctypes.c_size_t, _C_FP
+        ]
+        self.lib.qwen_bonsai2_gdn_conv_silu_f32.restype = ctypes.c_int
+        self.lib.qwen_bonsai2_gdn_norm_gate_f32.argtypes = [
+            _C_FP, _C_FP, _C_FP, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_float, _C_FP
+        ]
+        self.lib.qwen_bonsai2_gdn_norm_gate_f32.restype = ctypes.c_int
         self.lib.qwen_bonsai2_matvec_bf16_f32.argtypes = [
             _C_U8P, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
             _C_FP, _C_FP
@@ -188,6 +197,8 @@ class Bonsai2NativeRuntime:
             "bf16_matvec",
             "lookup_dequantize",
             "swiglu",
+            "gdn_conv_silu",
+            "gdn_norm_gate",
             "output_copy",
         )
         self.timing_seconds = {key: 0.0 for key in timing_keys}
@@ -277,6 +288,100 @@ class Bonsai2NativeRuntime:
         self._record_timing("swiglu", started)
         if rc != 0:
             raise RuntimeError(f"native Bonsai 2 SwiGLU failed rc={rc}")
+        started = time.perf_counter()
+        result = [float(out[i]) for i in range(n)]
+        self._record_timing("output_copy", started)
+        return result
+
+    def gdn_conv_silu(
+        self,
+        qkv: Sequence[float],
+        history: Sequence[Sequence[float]],
+        kernels: Sequence[float],
+    ) -> list[float]:
+        n = len(qkv)
+        if n == 0:
+            return []
+        if len(kernels) != n * 4:
+            raise ValueError(
+                f"GDN conv kernel shape mismatch qkv={n} kernels={len(kernels)}"
+            )
+        selected = list(history[-3:])
+        for row in selected:
+            if len(row) != n:
+                raise ValueError(
+                    f"GDN conv history shape mismatch qkv={n} history={len(row)}"
+                )
+
+        qkv_arr = (ctypes.c_float * n)(*map(float, qkv))
+        kernel_arr = (ctypes.c_float * (n * 4))(*map(float, kernels))
+        history_count = len(selected)
+        if history_count:
+            history_arr = (ctypes.c_float * (history_count * n))(
+                *(float(v) for row in selected for v in row)
+            )
+            history_ptr = ctypes.cast(history_arr, _C_FP)
+        else:
+            history_arr = None
+            history_ptr = None
+        out = (ctypes.c_float * n)()
+
+        started = time.perf_counter()
+        rc = self.lib.qwen_bonsai2_gdn_conv_silu_f32(
+            qkv_arr,
+            history_ptr,
+            history_count,
+            kernel_arr,
+            n,
+            out,
+        )
+        self._record_timing("gdn_conv_silu", started)
+        _ = history_arr
+        if rc != 0:
+            raise RuntimeError(f"native GDN conv+SiLU failed rc={rc}")
+
+        started = time.perf_counter()
+        result = [float(out[i]) for i in range(n)]
+        self._record_timing("output_copy", started)
+        return result
+
+    def gdn_norm_gate(
+        self,
+        core: Sequence[float],
+        norm_weight: Sequence[float],
+        z: Sequence[float],
+        *,
+        eps: float = 1e-6,
+    ) -> list[float]:
+        n = len(core)
+        head_dim = len(norm_weight)
+        if n == 0:
+            return []
+        if len(z) != n or head_dim == 0 or n % head_dim:
+            raise ValueError(
+                f"GDN norm-gate shape mismatch core={n} z={len(z)} "
+                f"head_dim={head_dim}"
+            )
+        heads = n // head_dim
+        core_arr = (ctypes.c_float * n)(*map(float, core))
+        weight_arr = (ctypes.c_float * head_dim)(*map(float, norm_weight))
+        z_arr = (ctypes.c_float * n)(*map(float, z))
+        out = (ctypes.c_float * n)()
+
+        started = time.perf_counter()
+        rc = self.lib.qwen_bonsai2_gdn_norm_gate_f32(
+            core_arr,
+            weight_arr,
+            z_arr,
+            heads,
+            head_dim,
+            ctypes.c_float(float(eps)),
+            out,
+        )
+        self._record_timing("gdn_norm_gate", started)
+        if rc != 0:
+            raise RuntimeError(f"native GDN norm+gate failed rc={rc}")
+
         started = time.perf_counter()
         result = [float(out[i]) for i in range(n)]
         self._record_timing("output_copy", started)
