@@ -20,6 +20,7 @@ class ProbeRuntime:
         self.rms_norm_calls = 0
         self.residual_add_calls = 0
         self.gdn_repeat_scale_calls = 0
+        self.recurrent_mid_calls = 0
 
     def rms_norm(self, values, weight, *, rows=1, eps=1e-6):
         self.rms_norm_calls += 1
@@ -78,6 +79,37 @@ class ProbeRuntime:
     def swiglu(self, gate, up):
         return [0.0] * gdn.INTERMEDIATE
 
+    def recurrent_mid(
+        self,
+        state_lib,
+        state,
+        qkv,
+        history,
+        kernels,
+        alpha,
+        beta_raw,
+        dt,
+        a,
+        z,
+        norm_weight,
+        *,
+        eps,
+        scale,
+    ):
+        self.recurrent_mid_calls += 1
+        assert len(qkv) == gdn.CONV_DIM
+        assert len(history) == 3
+        assert kernels == "ssm_conv1d.weight"
+        assert len(alpha) == gdn.V_HEADS
+        assert len(beta_raw) == gdn.V_HEADS
+        assert dt == "ssm_dt.bias"
+        assert a == "ssm_a"
+        assert len(z) == gdn.VALUE_DIM
+        assert norm_weight == "ssm_norm.weight"
+        assert eps == gdn.RMS_EPS
+        assert scale == spike.t2.SCALE_GDN
+        return [0.25] * gdn.VALUE_DIM
+
     def gdn_conv_silu(self, qkv, history, kernels):
         self.conv_calls += 1
         self.history_lengths.append(len(history))
@@ -96,7 +128,11 @@ class ProbeRuntime:
 
 
 class ProbeState:
+    def __init__(self) -> None:
+        self.calls = 0
+
     def step(self, state, q, k, v, gate, beta, out):
+        self.calls += 1
         for i in range(gdn.VALUE_DIM):
             out[i] = 0.0
         return 0
@@ -156,14 +192,21 @@ def main() -> None:
 
     assert len(out) == gdn.HIDDEN
     assert len(qkv) == gdn.CONV_DIM
-    assert runtime.conv_calls == 1, (
-        "prompt recurrent_step must delegate conv+SiLU exactly once, "
+    assert runtime.recurrent_mid_calls == 1, (
+        "prompt recurrent_step must delegate the recurrent middle path "
+        f"exactly once, calls={runtime.recurrent_mid_calls}"
+    )
+    assert runtime.conv_calls == 0, (
+        "prompt recurrent_step must not call standalone conv after mid fusion, "
         f"calls={runtime.conv_calls}"
     )
-    assert runtime.history_lengths == [3], runtime.history_lengths
-    assert runtime.norm_gate_calls == 1, (
-        "prompt recurrent_step must delegate state norm+gate exactly once, "
+    assert runtime.history_lengths == [], runtime.history_lengths
+    assert runtime.norm_gate_calls == 0, (
+        "prompt recurrent_step must not call standalone norm+gate after mid fusion, "
         f"calls={runtime.norm_gate_calls}"
+    )
+    assert state_lib.calls == 0, (
+        "prompt recurrent_step must not re-enter Python state step after mid fusion"
     )
     assert runtime.rms_norm_calls == 2, (
         "prompt recurrent_step must delegate both layer RMSNorms to native runtime, "
@@ -173,8 +216,8 @@ def main() -> None:
         "prompt recurrent_step must delegate both residual adds to native runtime, "
         f"calls={runtime.residual_add_calls}"
     )
-    assert runtime.gdn_repeat_scale_calls == 1, (
-        "prompt recurrent_step must delegate GDN q/k repeat-scale exactly once, "
+    assert runtime.gdn_repeat_scale_calls == 0, (
+        "prompt recurrent_step must not call standalone repeat-scale after mid fusion, "
         f"calls={runtime.gdn_repeat_scale_calls}"
     )
     assert runtime.ssm_out_input == [0.25] * gdn.VALUE_DIM
