@@ -538,6 +538,98 @@ static inline int32_t qwen_bonsai2_ptq1_dot_trits8_madd_sse(
     return _mm_cvtsi128_si32(sum32);
 }
 
+/* Reuse the widened packed PTQ1 payload across all five base-3 stages in
+ * one 128-weight block. Integer pair sums may be regrouped freely here:
+ * q is {-1,0,+1}, activation is int8, and the complete 32-term dot stays far
+ * inside int32. Floating-point scale/accumulation order is untouched. */
+static inline __m256i qwen_bonsai2_ptq1_pairs16_from_raw_avx2(
+        __m256i raw16, uint16_t pow3, const int8_t *activation) {
+    __m256i v = _mm256_mullo_epi16(
+        raw16, _mm256_set1_epi16((short)pow3));
+    v = _mm256_and_si256(v, _mm256_set1_epi16(0x00ff));
+    v = _mm256_mullo_epi16(v, _mm256_set1_epi16(3));
+    __m256i q = _mm256_srli_epi16(v, 8);
+    q = _mm256_sub_epi16(q, _mm256_set1_epi16(1));
+    const __m128i a8 = _mm_loadu_si128((const __m128i *)activation);
+    const __m256i a16 = _mm256_cvtepi8_epi16(a8);
+    return _mm256_madd_epi16(q, a16);
+}
+
+static inline __m128i qwen_bonsai2_ptq1_pairs8_from_raw_sse(
+        __m128i raw16, uint16_t pow3, const int8_t *activation) {
+    __m128i v = _mm_mullo_epi16(raw16, _mm_set1_epi16((short)pow3));
+    v = _mm_and_si128(v, _mm_set1_epi16(0x00ff));
+    v = _mm_mullo_epi16(v, _mm_set1_epi16(3));
+    __m128i q = _mm_srli_epi16(v, 8);
+    q = _mm_sub_epi16(q, _mm_set1_epi16(1));
+    const __m128i a8 = _mm_loadl_epi64((const __m128i *)activation);
+    const __m128i a16 = _mm_cvtepi8_epi16(a8);
+    return _mm_madd_epi16(q, a16);
+}
+
+static inline int32_t qwen_bonsai2_hsum4_i32_sse(__m128i x) {
+    x = _mm_hadd_epi32(x, x);
+    x = _mm_hadd_epi32(x, x);
+    return _mm_cvtsi128_si32(x);
+}
+
+static inline void qwen_bonsai2_ptq1_dot_block_reuse_avx2(
+        const uint8_t *xb,
+        const uint8_t *yb,
+        const int8_t lut[256][5],
+        int32_t dots[4]) {
+    static const uint16_t pow3[5] = {1, 3, 9, 27, 81};
+    const uint8_t *qs = xb;
+    const uint8_t *qh = xb + 24;
+    const int8_t *a0 = (const int8_t *)(yb + 0 * QWEN_BLOCK_Q8_0 + 2);
+    const int8_t *a1 = (const int8_t *)(yb + 1 * QWEN_BLOCK_Q8_0 + 2);
+    const int8_t *a2 = (const int8_t *)(yb + 2 * QWEN_BLOCK_Q8_0 + 2);
+    const int8_t *a3 = (const int8_t *)(yb + 3 * QWEN_BLOCK_Q8_0 + 2);
+
+    const __m128i packed16 = _mm_loadu_si128((const __m128i *)qs);
+    const __m256i raw16 = _mm256_cvtepu8_epi16(packed16);
+    const __m128i packed8 = _mm_loadl_epi64((const __m128i *)(qs + 16));
+    const __m128i raw8 = _mm_cvtepu8_epi16(packed8);
+
+    const __m256i d00 = qwen_bonsai2_ptq1_pairs16_from_raw_avx2(
+        raw16, pow3[0], a0 + 0);
+    const __m256i d01 = qwen_bonsai2_ptq1_pairs16_from_raw_avx2(
+        raw16, pow3[1], a0 + 16);
+    dots[0] = qwen_hsum8_i32(_mm256_add_epi32(d00, d01));
+
+    const __m256i d10 = qwen_bonsai2_ptq1_pairs16_from_raw_avx2(
+        raw16, pow3[2], a1 + 0);
+    const __m256i d11 = qwen_bonsai2_ptq1_pairs16_from_raw_avx2(
+        raw16, pow3[3], a1 + 16);
+    dots[1] = qwen_hsum8_i32(_mm256_add_epi32(d10, d11));
+
+    const __m256i d20 = qwen_bonsai2_ptq1_pairs16_from_raw_avx2(
+        raw16, pow3[4], a2 + 0);
+    const __m128i d21 = qwen_bonsai2_ptq1_pairs8_from_raw_sse(
+        raw8, pow3[0], a2 + 16);
+    const __m128i d22 = qwen_bonsai2_ptq1_pairs8_from_raw_sse(
+        raw8, pow3[1], a2 + 24);
+    dots[2] = qwen_hsum8_i32(d20) +
+        qwen_bonsai2_hsum4_i32_sse(_mm_add_epi32(d21, d22));
+
+    const __m128i d30 = qwen_bonsai2_ptq1_pairs8_from_raw_sse(
+        raw8, pow3[2], a3 + 0);
+    const __m128i d31 = qwen_bonsai2_ptq1_pairs8_from_raw_sse(
+        raw8, pow3[3], a3 + 8);
+    const __m128i d32 = qwen_bonsai2_ptq1_pairs8_from_raw_sse(
+        raw8, pow3[4], a3 + 16);
+    dots[3] = qwen_bonsai2_hsum4_i32_sse(
+        _mm_add_epi32(_mm_add_epi32(d30, d31), d32));
+
+    for (int nn = 0; nn < 4; ++nn) {
+        for (int hh = 0; hh < 2; ++hh) {
+            dots[3] +=
+                (int32_t)lut[qh[hh]][nn] *
+                (int32_t)a3[24 + nn * 2 + hh];
+        }
+    }
+}
+
 /* Fused PTQ1 decoder + Q8 dot.
  *
  * PTQ1's 24 qs bytes decode in two Prism stages: 16 bytes x 5 trits
@@ -613,35 +705,9 @@ static float qwen_bonsai2_vec_dot_ptq1_q8_0_fused_cached_scales(
 
     for (size_t ib = 0; ib < nb; ++ib) {
         const uint8_t *xb = weights + ib * QWEN_BLOCK_PTQ1_0;
-        const uint8_t *qs = xb;
-        const uint8_t *qh = xb + 24;
         const uint8_t *yb = activation + ib * 4 * QWEN_BLOCK_Q8_0;
-        const int8_t *a0 = (const int8_t *)(yb + 0 * QWEN_BLOCK_Q8_0 + 2);
-        const int8_t *a1 = (const int8_t *)(yb + 1 * QWEN_BLOCK_Q8_0 + 2);
-        const int8_t *a2 = (const int8_t *)(yb + 2 * QWEN_BLOCK_Q8_0 + 2);
-        const int8_t *a3 = (const int8_t *)(yb + 3 * QWEN_BLOCK_Q8_0 + 2);
-
-        int32_t dots[4] = {0, 0, 0, 0};
-
-        dots[0] += qwen_bonsai2_ptq1_dot_trits16_madd_avx2(qs, pow3[0], a0 + 0);
-        dots[0] += qwen_bonsai2_ptq1_dot_trits16_madd_avx2(qs, pow3[1], a0 + 16);
-        dots[1] += qwen_bonsai2_ptq1_dot_trits16_madd_avx2(qs, pow3[2], a1 + 0);
-        dots[1] += qwen_bonsai2_ptq1_dot_trits16_madd_avx2(qs, pow3[3], a1 + 16);
-        dots[2] += qwen_bonsai2_ptq1_dot_trits16_madd_avx2(qs, pow3[4], a2 + 0);
-
-        dots[2] += qwen_bonsai2_ptq1_dot_trits8_madd_sse(qs + 16, pow3[0], a2 + 16);
-        dots[2] += qwen_bonsai2_ptq1_dot_trits8_madd_sse(qs + 16, pow3[1], a2 + 24);
-        dots[3] += qwen_bonsai2_ptq1_dot_trits8_madd_sse(qs + 16, pow3[2], a3 + 0);
-        dots[3] += qwen_bonsai2_ptq1_dot_trits8_madd_sse(qs + 16, pow3[3], a3 + 8);
-        dots[3] += qwen_bonsai2_ptq1_dot_trits8_madd_sse(qs + 16, pow3[4], a3 + 16);
-
-        for (int nn = 0; nn < 4; ++nn) {
-            for (int h = 0; h < 2; ++h) {
-                dots[3] +=
-                    (int32_t)lut[qh[h]][nn] *
-                    (int32_t)a3[24 + nn * 2 + h];
-            }
-        }
+        int32_t dots[4];
+        qwen_bonsai2_ptq1_dot_block_reuse_avx2(xb, yb, lut, dots);
 
         const float d0 = qwen_f16_to_f32(qwen_load_u16_le(xb + 26));
         float sumi = 0.0f;
