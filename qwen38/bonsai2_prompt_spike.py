@@ -149,16 +149,7 @@ def recurrent_step(
     ]
 
     kernels = vec("ssm_conv1d.weight")
-    prior = list(history[-3:])
-    conv = [0.0] * gdn.CONV_DIM
-    for c in range(gdn.CONV_DIM):
-        current = mulf(qkv[c], kernels[c * gdn.CONV_KERNEL + 3])
-        for lag, old in enumerate(reversed(prior), start=1):
-            current = addf(
-                current,
-                mulf(old[c], kernels[c * gdn.CONV_KERNEL + 3 - lag]),
-            )
-        conv[c] = t2.siluf(current)
+    conv = runtime.gdn_conv_silu(qkv, history, kernels)
 
     q = conv[: gdn.KEY_DIM]
     k = conv[gdn.KEY_DIM : 2 * gdn.KEY_DIM]
@@ -187,15 +178,7 @@ def recurrent_step(
     core = [float(out_buf[i]) for i in range(gdn.VALUE_DIM)]
 
     norm_w = vec("ssm_norm.weight")
-    core_heads = gdn.split_heads(core, gdn.V_HEADS)
-    z_heads = gdn.split_heads(z, gdn.V_HEADS)
-    gated: list[float] = []
-    for core_head, z_head in zip(core_heads, z_heads):
-        normalized = rmswrap.ggml_rms_norm(core_head, norm_w, gdn.RMS_EPS)
-        gated.extend(
-            mulf(normalized[d], t2.siluf(z_head[d]))
-            for d in range(gdn.HEAD_DIM)
-        )
+    gated = runtime.gdn_norm_gate(core, norm_w, z, eps=gdn.RMS_EPS)
 
     linear = runtime.matvec(
         view("ssm_out.weight"), metas[f"{p}.ssm_out.weight"], gated
