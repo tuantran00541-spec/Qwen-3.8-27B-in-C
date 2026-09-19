@@ -26,6 +26,7 @@
 #define QWEN_BLOCK_PQ2_0 34
 #define QWEN_QK_PTQ1_0 128
 #define QWEN_BLOCK_PTQ1_0 28
+#define QWEN_BLOCK_PTQ1_2BIT 34
 
 #ifndef QWEN_EXPORT
 #ifdef _WIN32
@@ -471,6 +472,102 @@ static void qwen_bonsai2_decode_ptq1_block(
     for (int n = 0; n < 4; ++n) {
         for (int h = 0; h < 2; ++h) q[o++] = lut[qh[h]][n];
     }
+}
+
+
+QWEN_EXPORT size_t qwen_bonsai2_ptq1_2bit_row_bytes(size_t n) {
+    if (n == 0 || n % QWEN_QK_PTQ1_0 != 0) return 0;
+    return (n / QWEN_QK_PTQ1_0) * QWEN_BLOCK_PTQ1_2BIT;
+}
+
+QWEN_EXPORT int qwen_bonsai2_expand_ptq1_2bit(
+        const uint8_t *weights,
+        size_t weights_bytes,
+        size_t n,
+        uint8_t *out,
+        size_t out_bytes) {
+    if (!weights || !out || n == 0 || n % QWEN_QK_PTQ1_0 != 0) return -1;
+    const size_t nb = n / QWEN_QK_PTQ1_0;
+    if (weights_bytes != nb * QWEN_BLOCK_PTQ1_0) return -2;
+    if (out_bytes != nb * QWEN_BLOCK_PTQ1_2BIT) return -3;
+
+    int8_t lut[256][5];
+    int8_t q[QWEN_QK_PTQ1_0];
+    qwen_bonsai2_ptq1_lut(lut);
+
+    for (size_t ib = 0; ib < nb; ++ib) {
+        const uint8_t *srcb = weights + ib * QWEN_BLOCK_PTQ1_0;
+        uint8_t *dstb = out + ib * QWEN_BLOCK_PTQ1_2BIT;
+        qwen_bonsai2_decode_ptq1_block(srcb, lut, q);
+
+        for (int group = 0; group < 4; ++group) {
+            const int8_t *q32 = q + group * 32;
+            uint8_t *packed = dstb + group * 8;
+            for (int lane = 0; lane < 8; ++lane) {
+                const uint8_t q0 = (uint8_t)(q32[lane + 0] + 1);
+                const uint8_t q1 = (uint8_t)(q32[lane + 8] + 1);
+                const uint8_t q2 = (uint8_t)(q32[lane + 16] + 1);
+                const uint8_t q3 = (uint8_t)(q32[lane + 24] + 1);
+                packed[lane] = (uint8_t)(
+                    q0 | (uint8_t)(q1 << 2) |
+                    (uint8_t)(q2 << 4) | (uint8_t)(q3 << 6));
+            }
+        }
+
+        dstb[32] = srcb[26];
+        dstb[33] = srcb[27];
+    }
+    return 0;
+}
+
+static inline int32_t qwen_bonsai2_dot_ptq1_2bit_32_sse(
+        const uint8_t *packed,
+        const int8_t *activation) {
+    const __m128i raw8 = _mm_loadl_epi64((const __m128i *)packed);
+    const __m128i raw16 = _mm_cvtepu8_epi16(raw8);
+    const __m128i mask3 = _mm_set1_epi16(3);
+    const __m128i one = _mm_set1_epi16(1);
+    __m128i sum32 = _mm_setzero_si128();
+
+    for (int group = 0; group < 4; ++group) {
+        __m128i q16 = _mm_srli_epi16(raw16, group * 2);
+        q16 = _mm_and_si128(q16, mask3);
+        q16 = _mm_sub_epi16(q16, one);
+
+        const __m128i a8 = _mm_loadl_epi64(
+            (const __m128i *)(activation + group * 8));
+        const __m128i a16 = _mm_cvtepi8_epi16(a8);
+        sum32 = _mm_add_epi32(sum32, _mm_madd_epi16(q16, a16));
+    }
+
+    sum32 = _mm_hadd_epi32(sum32, sum32);
+    sum32 = _mm_hadd_epi32(sum32, sum32);
+    return _mm_cvtsi128_si32(sum32);
+}
+
+static float qwen_bonsai2_vec_dot_ptq1_2bit_q8_0(
+        const uint8_t *weights,
+        const uint8_t *activation,
+        size_t n) {
+    const size_t nb = n / QWEN_QK_PTQ1_0;
+    float sumf = 0.0f;
+
+    for (size_t ib = 0; ib < nb; ++ib) {
+        const uint8_t *xb = weights + ib * QWEN_BLOCK_PTQ1_2BIT;
+        const uint8_t *yb = activation + ib * 4 * QWEN_BLOCK_Q8_0;
+        const float d0 = qwen_f16_to_f32(qwen_load_u16_le(xb + 32));
+
+        float sumi = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+            const uint8_t *ab = yb + k * QWEN_BLOCK_Q8_0;
+            const float d1 = qwen_f16_to_f32(qwen_load_u16_le(ab));
+            const int32_t dot = qwen_bonsai2_dot_ptq1_2bit_32_sse(
+                xb + k * 8, (const int8_t *)(ab + 2));
+            sumi += d1 * (float)dot;
+        }
+        sumf += d0 * sumi;
+    }
+    return sumf;
 }
 
 static void qwen_bonsai2_decode_pq2_block(
