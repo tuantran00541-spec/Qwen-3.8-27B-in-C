@@ -139,6 +139,27 @@ class Bonsai2NativeRuntime:
             ctypes.c_float, _C_FP
         ]
         self.lib.qwen_bonsai2_gdn_norm_gate_f32.restype = ctypes.c_int
+        self.lib.qwen_bonsai2_recurrent_mid_f32.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            _C_FP,
+            _C_FP,
+            _C_FP,
+            _C_FP,
+            _C_FP,
+            ctypes.c_size_t,
+            _C_FP,
+            _C_FP,
+            _C_FP,
+            _C_FP,
+            _C_FP,
+            _C_FP,
+            _C_FP,
+            ctypes.c_float,
+            ctypes.c_float,
+            _C_FP,
+        ]
+        self.lib.qwen_bonsai2_recurrent_mid_f32.restype = ctypes.c_int
         self.lib.qwen_bonsai2_rms_norm_f32.argtypes = [
             _C_FP, _C_FP, ctypes.c_size_t, ctypes.c_size_t,
             ctypes.c_float, _C_FP
@@ -235,6 +256,7 @@ class Bonsai2NativeRuntime:
             "gdn_conv_silu",
             "gdn_repeat_scale",
             "gdn_norm_gate",
+            "recurrent_mid",
             "rms_norm",
             "output_copy",
         )
@@ -360,6 +382,45 @@ class Bonsai2NativeRuntime:
     @staticmethod
     def _array_f32_ptr(buf: array):
         return (ctypes.c_float * len(buf)).from_buffer(buf)
+
+    @staticmethod
+    def _borrow_f32(values, expected: int):
+        expected = int(expected)
+        if expected < 0:
+            raise ValueError("expected F32 length must be non-negative")
+        if isinstance(values, ctypes.Array):
+            if len(values) != expected:
+                raise ValueError(
+                    f"F32 ctypes length={len(values)} expected={expected}"
+                )
+            return values, ctypes.cast(values, _C_FP)
+        if isinstance(values, array):
+            if values.typecode != "f" or len(values) != expected:
+                raise ValueError(
+                    f"F32 array length={len(values)} expected={expected}"
+                )
+            owner = (ctypes.c_float * expected).from_buffer(values)
+            return owner, ctypes.cast(owner, _C_FP)
+        if isinstance(values, memoryview):
+            if values.nbytes != expected * ctypes.sizeof(ctypes.c_float):
+                raise ValueError(
+                    f"F32 view bytes={values.nbytes} expected={expected * 4}"
+                )
+            if values.readonly:
+                copied = array("f")
+                copied.frombytes(values.cast("B").tobytes())
+                owner = (ctypes.c_float * expected).from_buffer(copied)
+                return (copied, owner), ctypes.cast(owner, _C_FP)
+            owner = (ctypes.c_float * expected).from_buffer(values)
+            return owner, ctypes.cast(owner, _C_FP)
+
+        copied = array("f", map(float, values))
+        if len(copied) != expected:
+            raise ValueError(
+                f"F32 sequence length={len(copied)} expected={expected}"
+            )
+        owner = (ctypes.c_float * expected).from_buffer(copied)
+        return (copied, owner), ctypes.cast(owner, _C_FP)
 
     @staticmethod
     def _marshal_f32_output(out, n: int) -> list[float]:
@@ -583,6 +644,113 @@ class Bonsai2NativeRuntime:
 
         started = time.perf_counter()
         result = self._marshal_f32_output(out, n)
+        self._record_timing("output_copy", started)
+        return result
+
+    def recurrent_mid(
+        self,
+        state_lib,
+        state,
+        qkv,
+        history,
+        kernels,
+        alpha,
+        beta_raw,
+        dt,
+        a,
+        z,
+        norm_weight,
+        *,
+        eps: float,
+        scale: float,
+    ) -> list[float]:
+        key_heads = 16
+        value_heads = 48
+        head_dim = 128
+        key_dim = key_heads * head_dim
+        value_dim = value_heads * head_dim
+        conv_dim = 2 * key_dim + value_dim
+        state_elems = value_heads * head_dim * head_dim
+
+        if len(history) > 3:
+            raise ValueError(f"GDN history rows={len(history)} exceeds 3")
+
+        owners = []
+        for values, expected in (
+            (state, state_elems),
+            (qkv, conv_dim),
+            (kernels, conv_dim * 4),
+            (alpha, value_heads),
+            (beta_raw, value_heads),
+            (dt, value_heads),
+            (a, value_heads),
+            (z, value_dim),
+            (norm_weight, head_dim),
+        ):
+            owner, _ = self._borrow_f32(values, expected)
+            owners.append(owner)
+
+        state_owner, state_ptr = self._borrow_f32(state, state_elems)
+        qkv_owner, qkv_ptr = self._borrow_f32(qkv, conv_dim)
+        kernels_owner, kernels_ptr = self._borrow_f32(kernels, conv_dim * 4)
+        alpha_owner, alpha_ptr = self._borrow_f32(alpha, value_heads)
+        beta_owner, beta_ptr = self._borrow_f32(beta_raw, value_heads)
+        dt_owner, dt_ptr = self._borrow_f32(dt, value_heads)
+        a_owner, a_ptr = self._borrow_f32(a, value_heads)
+        z_owner, z_ptr = self._borrow_f32(z, value_dim)
+        norm_owner, norm_ptr = self._borrow_f32(norm_weight, head_dim)
+
+        history_owners = []
+        history_ptrs = [None, None, None]
+        for i, row in enumerate(history):
+            owner, row_ptr = self._borrow_f32(row, conv_dim)
+            history_owners.append(owner)
+            history_ptrs[i] = row_ptr
+
+        out = (ctypes.c_float * value_dim)()
+        step_fn = state_lib.lib.qwen_gdn_pool_step_f32
+        step_ptr = ctypes.cast(step_fn, ctypes.c_void_p)
+
+        started = time.perf_counter()
+        rc = self.lib.qwen_bonsai2_recurrent_mid_f32(
+            state_lib.pool,
+            step_ptr,
+            state_ptr,
+            qkv_ptr,
+            history_ptrs[0],
+            history_ptrs[1],
+            history_ptrs[2],
+            len(history),
+            kernels_ptr,
+            alpha_ptr,
+            beta_ptr,
+            dt_ptr,
+            a_ptr,
+            z_ptr,
+            norm_ptr,
+            ctypes.c_float(float(eps)),
+            ctypes.c_float(float(scale)),
+            out,
+        )
+        self._record_timing("recurrent_mid", started)
+        _ = (
+            owners,
+            state_owner,
+            qkv_owner,
+            kernels_owner,
+            alpha_owner,
+            beta_owner,
+            dt_owner,
+            a_owner,
+            z_owner,
+            norm_owner,
+            history_owners,
+        )
+        if rc != 0:
+            raise RuntimeError(f"native recurrent mid failed rc={rc}")
+
+        started = time.perf_counter()
+        result = self._marshal_f32_output(out, value_dim)
         self._record_timing("output_copy", started)
         return result
 
