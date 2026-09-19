@@ -17,6 +17,7 @@ class ProbeRuntime:
         self.norm_gate_calls = 0
         self.ssm_out_input = None
         self.rms_norm_calls = 0
+        self.residual_add_calls = 0
 
     def rms_norm(self, values, weight, *, rows=1, eps=1e-6):
         self.rms_norm_calls += 1
@@ -28,6 +29,11 @@ class ProbeRuntime:
             start = row * width
             out.extend(gdn.rms_norm(values[start:start + width], weight, eps))
         return out
+
+    def residual_add(self, a, b):
+        self.residual_add_calls += 1
+        assert len(a) == len(b)
+        return [float(a[i]) + float(b[i]) for i in range(len(a))]
 
     def prepare_activation(self, weight_name, x):
         return ("prepared", weight_name, len(x))
@@ -141,6 +147,10 @@ def main() -> None:
     assert runtime.rms_norm_calls == 2, (
         "recurrent_step must delegate both layer RMSNorms to native runtime, "
         f"calls={runtime.rms_norm_calls}"
+    )
+    assert runtime.residual_add_calls == 2, (
+        "recurrent_step must delegate both residual adds to native runtime, "
+        f"calls={runtime.residual_add_calls}"
     )
     assert runtime.ssm_out_input == [0.125] * gdn.VALUE_DIM, (
         "ssm_out must consume native norm+gate output"
