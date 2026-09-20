@@ -151,13 +151,29 @@ def run_recurrent_layer(runtime, view, metas, vec, hidden: Sequence[float], laye
     x = runtime.rms_norm(hidden, vec("attn_norm.weight"), eps=gdn.RMS_EPS)
 
     # qkv/z share the same 5120-wide folded activation.
-    qkv, z, beta_raw, alpha = runtime.recurrent_projections(
-        x,
-        view("attn_qkv.weight"), metas[f"{p}.attn_qkv.weight"],
-        view("attn_gate.weight"), metas[f"{p}.attn_gate.weight"],
-        view("ssm_beta.weight"), metas[f"{p}.ssm_beta.weight"],
-        view("ssm_alpha.weight"), metas[f"{p}.ssm_alpha.weight"],
-    )
+    recurrent_bundle = getattr(runtime, "recurrent_projections", None)
+    if recurrent_bundle is not None:
+        qkv, z, beta_raw, alpha = recurrent_bundle(
+            x,
+            view("attn_qkv.weight"), metas[f"{p}.attn_qkv.weight"],
+            view("attn_gate.weight"), metas[f"{p}.attn_gate.weight"],
+            view("ssm_beta.weight"), metas[f"{p}.ssm_beta.weight"],
+            view("ssm_alpha.weight"), metas[f"{p}.ssm_alpha.weight"],
+        )
+    else:
+        prepared = runtime.prepare_activation(f"{p}.attn_qkv.weight", x)
+        qkv = runtime.matvec_prepared(
+            view("attn_qkv.weight"), metas[f"{p}.attn_qkv.weight"], prepared
+        )
+        z = runtime.matvec_prepared(
+            view("attn_gate.weight"), metas[f"{p}.attn_gate.weight"], prepared
+        )
+        beta_raw = runtime.matvec(
+            view("ssm_beta.weight"), metas[f"{p}.ssm_beta.weight"], x
+        )
+        alpha = runtime.matvec(
+            view("ssm_alpha.weight"), metas[f"{p}.ssm_alpha.weight"], x
+        )
     beta = [gdn.sigmoid(v) for v in beta_raw]
 
     # First token starts from zero recurrent state. Evaluate the decay contract
