@@ -76,7 +76,10 @@ def main() -> None:
         "prism.hadamard.gdn_v_grouped": False,
     }
     runtime = Bonsai2NativeRuntime(
-        Path(sys.argv[1]), metadata, threads=2, max_rows=QKV_ROWS + GATE_ROWS + 32
+        Path(sys.argv[1]),
+        metadata,
+        threads=2,
+        max_rows=max(HIDDEN, QKV_ROWS + GATE_ROWS + 32),
     )
     try:
         x = array(
