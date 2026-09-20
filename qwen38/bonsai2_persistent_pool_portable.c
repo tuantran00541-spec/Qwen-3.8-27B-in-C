@@ -359,7 +359,8 @@ static int qwen_bonsai2_pool_matvec_ptq1_pair_cached(
         return -1;
     }
     const size_t total_rows = rows0 + rows1;
-    if (total_rows < rows0 || total_rows > p->max_rows) return -2;
+    if (total_rows < rows0 ||
+        rows0 > p->max_rows || rows1 > p->max_rows) return -2;
     const size_t row_bytes =
         qwen_bonsai2_pool_row_bytes(QWEN_BONSAI2_KIND_PTQ1, n);
     if (row_bytes == 0) return -3;
