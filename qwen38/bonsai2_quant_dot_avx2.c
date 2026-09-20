@@ -956,27 +956,13 @@ static inline void qwen_bonsai2_ptq1_dot_block_reuse_avx2(
     dots[3] = qwen_bonsai2_hsum4_i32_sse(
         _mm_add_epi32(_mm_add_epi32(d30, d31), d32));
 
-    /* qh stores the final 8 ternary values as two base-3 bytes.
-     * Broadcast the byte pair four times, decode powers 1/3/9/27 in
-     * parallel, then dot all eight lanes at once. This is integer-exact
-     * relative to the LUT loop but avoids eight scalar LUT loads/multiplies. */
-    const __m128i qh_bytes =
-        _mm_set1_epi16((short)qwen_load_u16_le(qh));
-    __m128i qh16 = _mm_cvtepu8_epi16(qh_bytes);
-    const __m128i qh_powers =
-        _mm_setr_epi16(1, 1, 3, 3, 9, 9, 27, 27);
-    qh16 = _mm_mullo_epi16(qh16, qh_powers);
-    qh16 = _mm_and_si128(qh16, _mm_set1_epi16(0x00ff));
-    qh16 = _mm_mullo_epi16(qh16, _mm_set1_epi16(3));
-    qh16 = _mm_srli_epi16(qh16, 8);
-    qh16 = _mm_sub_epi16(qh16, _mm_set1_epi16(1));
-
-    const __m128i ah8 =
-        _mm_loadl_epi64((const __m128i *)(a3 + 24));
-    const __m128i ah16 = _mm_cvtepi8_epi16(ah8);
-    dots[3] += qwen_bonsai2_hsum4_i32_sse(
-        _mm_madd_epi16(qh16, ah16));
-    (void)lut;
+    for (int nn = 0; nn < 4; ++nn) {
+        for (int hh = 0; hh < 2; ++hh) {
+            dots[3] +=
+                (int32_t)lut[qh[hh]][nn] *
+                (int32_t)a3[24 + nn * 2 + hh];
+        }
+    }
 }
 
 /* Fused PTQ1 decoder + Q8 dot.
