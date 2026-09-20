@@ -150,15 +150,13 @@ def recurrent_step(runtime, state_lib, state, prev_qkv, view, metas, vec,
                    hidden: Sequence[float], layer: int, token_index: int):
     p = f"blk.{layer}"
     x = runtime.rms_norm(hidden, vec("attn_norm.weight"), eps=gdn.RMS_EPS)
-    prepared = runtime.prepare_activation(f"{p}.attn_qkv.weight", x)
-    qkv = runtime.matvec_prepared(
-        view("attn_qkv.weight"), metas[f"{p}.attn_qkv.weight"], prepared
+    qkv, z, beta_raw, alpha = runtime.recurrent_projections(
+        x,
+        view("attn_qkv.weight"), metas[f"{p}.attn_qkv.weight"],
+        view("attn_gate.weight"), metas[f"{p}.attn_gate.weight"],
+        view("ssm_beta.weight"), metas[f"{p}.ssm_beta.weight"],
+        view("ssm_alpha.weight"), metas[f"{p}.ssm_alpha.weight"],
     )
-    z = runtime.matvec_prepared(
-        view("attn_gate.weight"), metas[f"{p}.attn_gate.weight"], prepared
-    )
-    beta_raw = runtime.matvec(view("ssm_beta.weight"), metas[f"{p}.ssm_beta.weight"], x)
-    alpha = runtime.matvec(view("ssm_alpha.weight"), metas[f"{p}.ssm_alpha.weight"], x)
     beta = [exact.sigmoid_f32(v) for v in beta_raw]
     dt = vec("ssm_dt.bias"); aa = vec("ssm_a")
     gate = [mulf(aa[h], softplusf(addf(alpha[h], dt[h]))) for h in range(gdn.V_HEADS)]

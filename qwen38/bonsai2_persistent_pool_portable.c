@@ -49,6 +49,14 @@ struct qwen_bonsai2_pool {
     size_t activation_bytes;
     float *out;
 
+    int pair_mode;
+    const uint8_t *pair_weights1;
+    size_t pair_rows0;
+    size_t pair_rows1;
+    float *pair_out1;
+    const float *ptq1_activation_scales;
+    int8_t ptq1_lut[256][5];
+
     size_t scratch_floats;
     float *scratch0;
     float *scratch1;
@@ -69,8 +77,43 @@ static size_t qwen_bonsai2_pool_row_bytes(qwen_bonsai2_kind kind, size_t n) {
     return 0;
 }
 
+static int qwen_bonsai2_pool_compute_ptq1_pair(qwen_bonsai2_worker *w) {
+    qwen_bonsai2_pool *p = w->pool;
+    const size_t total_rows = p->pair_rows0 + p->pair_rows1;
+    const size_t begin = total_rows * (size_t)w->ith / (size_t)p->n_threads;
+    const size_t end = total_rows * (size_t)(w->ith + 1) / (size_t)p->n_threads;
+    if (begin == end) return 0;
+
+    const size_t row_bytes =
+        qwen_bonsai2_pool_row_bytes(QWEN_BONSAI2_KIND_PTQ1, p->n);
+    if (row_bytes == 0 || !p->ptq1_activation_scales) return -30;
+
+    for (size_t gr = begin; gr < end; ++gr) {
+        const uint8_t *row;
+        float *dst;
+        if (gr < p->pair_rows0) {
+            row = p->weights + gr * row_bytes;
+            dst = p->out + gr;
+        } else {
+            const size_t r1 = gr - p->pair_rows0;
+            row = p->pair_weights1 + r1 * row_bytes;
+            dst = p->pair_out1 + r1;
+        }
+        *dst = qwen_bonsai2_vec_dot_ptq1_q8_0_fused_cached_scales(
+            row,
+            p->activation,
+            p->ptq1_activation_scales,
+            p->n,
+            p->ptq1_lut);
+    }
+    return 0;
+}
+
 static int qwen_bonsai2_pool_compute(qwen_bonsai2_worker *w) {
     qwen_bonsai2_pool *p = w->pool;
+    if (p->pair_mode) {
+        return qwen_bonsai2_pool_compute_ptq1_pair(w);
+    }
     const size_t begin = p->rows * (size_t)w->ith / (size_t)p->n_threads;
     const size_t end = p->rows * (size_t)(w->ith + 1) / (size_t)p->n_threads;
     const size_t local_rows = end - begin;
@@ -175,6 +218,7 @@ QWEN_EXPORT void *qwen_bonsai2_pool_create(int n_threads, size_t max_rows) {
         return NULL;
     }
 
+    qwen_bonsai2_ptq1_lut(p->ptq1_lut);
     for (int i = 0; i < n_threads; ++i) {
         p->workers[i].pool = p;
         p->workers[i].ith = i;
@@ -249,6 +293,7 @@ static int qwen_bonsai2_pool_matvec(
     }
 
     qwen_mutex_lock(&p->mutex);
+    p->pair_mode = 0;
     p->kind = kind;
     p->weights = weights;
     p->weights_bytes = weights_bytes;
@@ -297,6 +342,190 @@ QWEN_EXPORT int qwen_bonsai2_pool_matvec_pq2_0(
         opaque, QWEN_BONSAI2_KIND_PQ2,
         weights, weights_bytes, rows, n,
         activation, activation_bytes, out);
+}
+
+
+static int qwen_bonsai2_pool_matvec_ptq1_pair(
+        qwen_bonsai2_pool *p,
+        const uint8_t *weights0, size_t weights0_bytes, size_t rows0,
+        const uint8_t *weights1, size_t weights1_bytes, size_t rows1,
+        size_t n,
+        const uint8_t *activation, size_t activation_bytes,
+        const float *activation_scales,
+        float *out0, float *out1) {
+    if (!p || !weights0 || !weights1 || !activation ||
+        !activation_scales || !out0 || !out1 ||
+        rows0 == 0 || rows1 == 0 || n == 0) {
+        return -1;
+    }
+    const size_t total_rows = rows0 + rows1;
+    if (total_rows < rows0 || total_rows > p->max_rows) return -2;
+    const size_t row_bytes =
+        qwen_bonsai2_pool_row_bytes(QWEN_BONSAI2_KIND_PTQ1, n);
+    if (row_bytes == 0) return -3;
+    if (weights0_bytes != rows0 * row_bytes ||
+        weights1_bytes != rows1 * row_bytes) {
+        return -4;
+    }
+    if (activation_bytes != (n / 32u) * QWEN_BLOCK_Q8_0) return -5;
+
+    if (p->n_threads == 1) {
+        p->weights = weights0;
+        p->pair_weights1 = weights1;
+        p->pair_rows0 = rows0;
+        p->pair_rows1 = rows1;
+        p->rows = total_rows;
+        p->n = n;
+        p->activation = activation;
+        p->activation_bytes = activation_bytes;
+        p->out = out0;
+        p->pair_out1 = out1;
+        p->ptq1_activation_scales = activation_scales;
+        p->pair_mode = 1;
+        const int rc = qwen_bonsai2_pool_compute_ptq1_pair(&p->workers[0]);
+        p->pair_mode = 0;
+        if (rc == 0) p->calls += 1;
+        return rc;
+    }
+
+    qwen_mutex_lock(&p->mutex);
+    p->pair_mode = 1;
+    p->kind = QWEN_BONSAI2_KIND_PTQ1;
+    p->weights = weights0;
+    p->weights_bytes = weights0_bytes;
+    p->pair_weights1 = weights1;
+    p->pair_rows0 = rows0;
+    p->pair_rows1 = rows1;
+    p->rows = total_rows;
+    p->n = n;
+    p->activation = activation;
+    p->activation_bytes = activation_bytes;
+    p->out = out0;
+    p->pair_out1 = out1;
+    p->ptq1_activation_scales = activation_scales;
+    p->done_workers = 0;
+    for (int i = 0; i < p->n_threads; ++i) p->workers[i].rc = 0;
+    p->generation += 1;
+    qwen_cond_broadcast(&p->work_cond);
+    qwen_mutex_unlock(&p->mutex);
+
+    p->workers[0].rc = qwen_bonsai2_pool_compute(&p->workers[0]);
+
+    qwen_mutex_lock(&p->mutex);
+    while (p->done_workers != p->n_threads - 1) {
+        qwen_cond_wait(&p->done_cond, &p->mutex);
+    }
+    qwen_mutex_unlock(&p->mutex);
+
+    int rc = p->workers[0].rc;
+    for (int i = 1; i < p->n_threads && rc == 0; ++i) {
+        if (p->workers[i].rc != 0) rc = p->workers[i].rc;
+    }
+    p->pair_mode = 0;
+    if (rc == 0) p->calls += 1;
+    return rc;
+}
+
+QWEN_EXPORT int qwen_bonsai2_pool_recurrent_projections_ptq1_bf16(
+        void *opaque,
+        const float *x,
+        size_t hidden,
+        const uint8_t *qkv_weights,
+        size_t qkv_bytes,
+        size_t qkv_rows,
+        const uint8_t *gate_weights,
+        size_t gate_bytes,
+        size_t gate_rows,
+        const uint8_t *beta_weights,
+        size_t beta_bytes,
+        size_t beta_rows,
+        const uint8_t *alpha_weights,
+        size_t alpha_bytes,
+        size_t alpha_rows,
+        int apply_hadamard,
+        size_t block_size,
+        const int8_t *sign_hidden,
+        float *qkv_out,
+        float *gate_out,
+        float *beta_out,
+        float *alpha_out) {
+    qwen_bonsai2_pool *p = (qwen_bonsai2_pool *)opaque;
+    if (!p || !x || !qkv_weights || !gate_weights ||
+        !beta_weights || !alpha_weights ||
+        !qkv_out || !gate_out || !beta_out || !alpha_out) {
+        return -1;
+    }
+    if (hidden == 0 || hidden > p->scratch_floats ||
+        hidden % 128u != 0 ||
+        qkv_rows == 0 || gate_rows == 0 ||
+        beta_rows == 0 || alpha_rows == 0) {
+        return -2;
+    }
+
+    const size_t ptq1_row =
+        qwen_bonsai2_pool_row_bytes(QWEN_BONSAI2_KIND_PTQ1, hidden);
+    if (ptq1_row == 0 ||
+        qkv_bytes != qkv_rows * ptq1_row ||
+        gate_bytes != gate_rows * ptq1_row ||
+        beta_bytes != beta_rows * hidden * sizeof(uint16_t) ||
+        alpha_bytes != alpha_rows * hidden * sizeof(uint16_t)) {
+        return -3;
+    }
+
+    const size_t q8_bytes = (hidden / 32u) * QWEN_BLOCK_Q8_0;
+    if (q8_bytes > p->scratch_q8_bytes) return -4;
+    if (apply_hadamard &&
+        (block_size == 0 || (block_size & (block_size - 1u)) != 0 ||
+         hidden % block_size != 0)) {
+        return -5;
+    }
+
+    memcpy(p->scratch0, x, hidden * sizeof(float));
+    int rc = 0;
+    if (apply_hadamard) {
+        rc = qwen_bonsai2_fwht_blocks(
+            p->scratch0, hidden, block_size, sign_hidden);
+        if (rc != 0) return -10 + rc;
+    }
+    rc = qwen_quantize_q8_0_scalar(
+        p->scratch0, hidden, p->scratch_q8, q8_bytes);
+    if (rc != 0) return -20 + rc;
+
+    const size_t q8_blocks = hidden / 32u;
+    float *activation_scales = p->scratch0;
+    for (size_t ib = 0; ib < q8_blocks; ++ib) {
+        const uint8_t *ab = p->scratch_q8 + ib * QWEN_BLOCK_Q8_0;
+        activation_scales[ib] =
+            qwen_f16_to_f32(qwen_load_u16_le(ab));
+    }
+
+    rc = qwen_bonsai2_pool_matvec_ptq1_pair(
+        p,
+        qkv_weights, qkv_bytes, qkv_rows,
+        gate_weights, gate_bytes, gate_rows,
+        hidden,
+        p->scratch_q8, q8_bytes,
+        activation_scales,
+        qkv_out, gate_out);
+    if (rc != 0) return -30 + rc;
+
+    uint16_t *activation_bf16 = (uint16_t *)p->scratch0;
+    for (size_t i = 0; i < hidden; ++i) {
+        activation_bf16[i] = qwen_bonsai2_f32_to_bf16_rne(x[i]);
+    }
+    for (size_t r = 0; r < beta_rows; ++r) {
+        const uint16_t *row =
+            (const uint16_t *)(beta_weights + r * hidden * sizeof(uint16_t));
+        beta_out[r] =
+            qwen_bonsai2_vec_dot_bf16_avx2(row, activation_bf16, hidden);
+    }
+    for (size_t r = 0; r < alpha_rows; ++r) {
+        const uint16_t *row =
+            (const uint16_t *)(alpha_weights + r * hidden * sizeof(uint16_t));
+        alpha_out[r] =
+            qwen_bonsai2_vec_dot_bf16_avx2(row, activation_bf16, hidden);
+    }
+    return 0;
 }
 
 QWEN_EXPORT int qwen_bonsai2_pool_ffn_ptq1_0(

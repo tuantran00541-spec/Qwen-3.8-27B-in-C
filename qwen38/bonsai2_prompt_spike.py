@@ -211,18 +211,12 @@ def recurrent_step(
     p = f"blk.{layer}"
     x = runtime.rms_norm(hidden, vec("attn_norm.weight"), eps=gdn.RMS_EPS)
 
-    prepared = runtime.prepare_activation(f"{p}.attn_qkv.weight", x)
-    qkv = runtime.matvec_prepared(
-        view("attn_qkv.weight"), metas[f"{p}.attn_qkv.weight"], prepared
-    )
-    z = runtime.matvec_prepared(
-        view("attn_gate.weight"), metas[f"{p}.attn_gate.weight"], prepared
-    )
-    beta_raw = runtime.matvec(
-        view("ssm_beta.weight"), metas[f"{p}.ssm_beta.weight"], x
-    )
-    alpha = runtime.matvec(
-        view("ssm_alpha.weight"), metas[f"{p}.ssm_alpha.weight"], x
+    qkv, z, beta_raw, alpha = runtime.recurrent_projections(
+        x,
+        view("attn_qkv.weight"), metas[f"{p}.attn_qkv.weight"],
+        view("attn_gate.weight"), metas[f"{p}.attn_gate.weight"],
+        view("ssm_beta.weight"), metas[f"{p}.ssm_beta.weight"],
+        view("ssm_alpha.weight"), metas[f"{p}.ssm_alpha.weight"],
     )
     gated = runtime.recurrent_mid(
         state_lib,

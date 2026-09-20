@@ -202,6 +202,37 @@ class Bonsai2NativeRuntime:
                 _C_FP,
             ]
             self.lib.qwen_bonsai2_pool_ffn_ptq1_0.restype = ctypes.c_int
+            if hasattr(
+                self.lib,
+                "qwen_bonsai2_pool_recurrent_projections_ptq1_bf16",
+            ):
+                self.lib.qwen_bonsai2_pool_recurrent_projections_ptq1_bf16.argtypes = [
+                    ctypes.c_void_p,
+                    _C_FP,
+                    ctypes.c_size_t,
+                    _C_U8P,
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                    _C_U8P,
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                    _C_U8P,
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                    _C_U8P,
+                    ctypes.c_size_t,
+                    ctypes.c_size_t,
+                    ctypes.c_int,
+                    ctypes.c_size_t,
+                    _C_I8P,
+                    _C_FP,
+                    _C_FP,
+                    _C_FP,
+                    _C_FP,
+                ]
+                self.lib.qwen_bonsai2_pool_recurrent_projections_ptq1_bf16.restype = (
+                    ctypes.c_int
+                )
             for name in (
                 "qwen_bonsai2_pool_matvec_ptq1_0",
                 "qwen_bonsai2_pool_matvec_pq2_0",
@@ -274,6 +305,7 @@ class Bonsai2NativeRuntime:
             "gdn_repeat_scale",
             "gdn_norm_gate",
             "recurrent_mid",
+            "recurrent_projections",
             "ffn",
             "rms_norm",
             "output_copy",
@@ -898,6 +930,124 @@ class Bonsai2NativeRuntime:
 
         started = time.perf_counter()
         result = self._marshal_f32_output(out, hidden)
+        self._record_timing("output_copy", started)
+        return result
+
+
+    def recurrent_projections(
+        self,
+        x: Sequence[float],
+        qkv_weights: memoryview,
+        qkv_meta: Mapping[str, Any],
+        gate_weights: memoryview,
+        gate_meta: Mapping[str, Any],
+        beta_weights: memoryview,
+        beta_meta: Mapping[str, Any],
+        alpha_weights: memoryview,
+        alpha_meta: Mapping[str, Any],
+    ) -> tuple[list[float], list[float], list[float], list[float]]:
+        qkv_kind = str(qkv_meta["type_name"])
+        gate_kind = str(gate_meta["type_name"])
+        beta_kind = str(beta_meta["type_name"])
+        alpha_kind = str(alpha_meta["type_name"])
+        hidden, qkv_rows = map(int, qkv_meta["shape"])
+        gate_hidden, gate_rows = map(int, gate_meta["shape"])
+        beta_hidden, beta_rows = map(int, beta_meta["shape"])
+        alpha_hidden, alpha_rows = map(int, alpha_meta["shape"])
+        if (
+            gate_hidden != hidden
+            or beta_hidden != hidden
+            or alpha_hidden != hidden
+            or len(x) != hidden
+        ):
+            raise ValueError(
+                "recurrent projection geometry mismatch: "
+                f"x={len(x)} qkv={list(qkv_meta['shape'])} "
+                f"gate={list(gate_meta['shape'])} "
+                f"beta={list(beta_meta['shape'])} "
+                f"alpha={list(alpha_meta['shape'])}"
+            )
+
+        qkv_name = str(qkv_meta["name"])
+        gate_name = str(gate_meta["name"])
+        qkv_folded = qkv_name in self.folded_weights
+        gate_folded = gate_name in self.folded_weights
+        native_bundle = getattr(
+            self.lib,
+            "qwen_bonsai2_pool_recurrent_projections_ptq1_bf16",
+            None,
+        )
+        if (
+            not self.pool
+            or native_bundle is None
+            or qkv_kind != "PTQ1_0"
+            or gate_kind != "PTQ1_0"
+            or beta_kind != "BF16"
+            or alpha_kind != "BF16"
+            or qkv_folded != gate_folded
+        ):
+            prepared = self.prepare_activation(qkv_name, x)
+            qkv = self.matvec_prepared(qkv_weights, qkv_meta, prepared)
+            gate = self.matvec_prepared(gate_weights, gate_meta, prepared)
+            beta = self.matvec(beta_weights, beta_meta, x)
+            alpha = self.matvec(alpha_weights, alpha_meta, x)
+            return qkv, gate, beta, alpha
+
+        x_owner, x_ptr = self._borrow_f32(x, hidden)
+        qkv_arr = (ctypes.c_uint8 * len(qkv_weights)).from_buffer(qkv_weights)
+        gate_arr = (ctypes.c_uint8 * len(gate_weights)).from_buffer(gate_weights)
+        beta_arr = (ctypes.c_uint8 * len(beta_weights)).from_buffer(beta_weights)
+        alpha_arr = (ctypes.c_uint8 * len(alpha_weights)).from_buffer(alpha_weights)
+        sign_owner, sign_ptr = self._sign_array(hidden)
+        qkv_out = (ctypes.c_float * qkv_rows)()
+        gate_out = (ctypes.c_float * gate_rows)()
+        beta_out = (ctypes.c_float * beta_rows)()
+        alpha_out = (ctypes.c_float * alpha_rows)()
+
+        started = time.perf_counter()
+        rc = native_bundle(
+            self.pool,
+            x_ptr,
+            hidden,
+            qkv_arr,
+            len(qkv_weights),
+            qkv_rows,
+            gate_arr,
+            len(gate_weights),
+            gate_rows,
+            beta_arr,
+            len(beta_weights),
+            beta_rows,
+            alpha_arr,
+            len(alpha_weights),
+            alpha_rows,
+            int(qkv_folded),
+            self.block_size,
+            sign_ptr,
+            qkv_out,
+            gate_out,
+            beta_out,
+            alpha_out,
+        )
+        self._record_timing("recurrent_projections", started)
+        _ = (x_owner, sign_owner)
+        if rc != 0:
+            raise RuntimeError(
+                f"native recurrent projection bundle failed rc={rc}"
+            )
+
+        self.activation_quantizations += 1
+        if qkv_folded:
+            self.hadamard_transforms += 1
+        self.matvec_rows += qkv_rows + gate_rows + beta_rows + alpha_rows
+
+        started = time.perf_counter()
+        result = (
+            self._marshal_f32_output(qkv_out, qkv_rows),
+            self._marshal_f32_output(gate_out, gate_rows),
+            self._marshal_f32_output(beta_out, beta_rows),
+            self._marshal_f32_output(alpha_out, alpha_rows),
+        )
         self._record_timing("output_copy", started)
         return result
 
