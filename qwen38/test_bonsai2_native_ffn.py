@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import ctypes
 from pathlib import Path
+import statistics
 import struct
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "qwen38"))
@@ -15,6 +17,8 @@ import bonsai2_two_token as t2
 HIDDEN = 256
 INTERMEDIATE = 512
 BLOCK = 128
+REAL_HIDDEN = 5120
+REAL_INTERMEDIATE = 17408
 FP = ctypes.POINTER(ctypes.c_float)
 U8P = ctypes.POINTER(ctypes.c_uint8)
 I8P = ctypes.POINTER(ctypes.c_int8)
@@ -117,6 +121,117 @@ def verify_t2_ffn_delegates_once() -> None:
         raise AssertionError(out)
     if runtime.calls != 1:
         raise AssertionError(f"expected one native FFN delegation, got {runtime.calls}")
+
+
+
+def repeated_ptq1_weights(rows: int, n: int, seed: int) -> bytearray:
+    rng = RNG(seed)
+    block = bytearray((rng.u32() & 0xFF) for _ in range(26))
+    block.extend(struct.pack("<e", (0.125, 0.25, 0.5, 1.0)[rng.u32() % 4]))
+    return block * (rows * (n // 128))
+
+
+def benchmark_shared_scales(lib_path: Path) -> None:
+    runtime = Bonsai2NativeRuntime(
+        lib_path, metadata(), threads=4, max_rows=REAL_INTERMEDIATE
+    )
+    try:
+        old_fn = runtime.lib.qwen_bonsai2_pool_matvec_ptq1_0
+        new_fn = runtime.lib.qwen_bonsai2_pool_matvec_ptq1_0_shared_scales
+        new_fn.argtypes = [
+            ctypes.c_void_p,
+            U8P,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            U8P,
+            ctypes.c_size_t,
+            FP,
+        ]
+        new_fn.restype = ctypes.c_int
+
+        cases = [
+            ("ffn-gate-up", REAL_INTERMEDIATE, REAL_HIDDEN, 0x551001),
+            ("ffn-down", REAL_HIDDEN, REAL_INTERMEDIATE, 0x551002),
+        ]
+        for label, rows, n, seed in cases:
+            weights = repeated_ptq1_weights(rows, n, seed)
+            weights_buf = (ctypes.c_uint8 * len(weights)).from_buffer(weights)
+            x = [((i % 257) - 128) / 128.0 for i in range(n)]
+            tensor_name = (
+                "blk.0.ffn_gate.weight"
+                if n == REAL_HIDDEN
+                else "blk.0.ffn_down.weight"
+            )
+            activation, activation_bytes = runtime.prepare_activation(
+                tensor_name, x
+            )
+            old_out = (ctypes.c_float * rows)()
+            new_out = (ctypes.c_float * rows)()
+
+            def run_old() -> None:
+                rc = old_fn(
+                    runtime.pool,
+                    weights_buf,
+                    len(weights),
+                    rows,
+                    n,
+                    activation,
+                    activation_bytes,
+                    old_out,
+                )
+                if rc != 0:
+                    raise AssertionError(f"{label} old rc={rc}")
+
+            def run_new() -> None:
+                rc = new_fn(
+                    runtime.pool,
+                    weights_buf,
+                    len(weights),
+                    rows,
+                    n,
+                    activation,
+                    activation_bytes,
+                    new_out,
+                )
+                if rc != 0:
+                    raise AssertionError(f"{label} new rc={rc}")
+
+            run_old()
+            run_new()
+            if bytes(memoryview(old_out).cast("B")) != bytes(
+                memoryview(new_out).cast("B")
+            ):
+                raise AssertionError(
+                    f"{label} shared-scale path is not bitwise identical"
+                )
+
+            old_samples: list[float] = []
+            new_samples: list[float] = []
+            for sample in range(6):
+                order = (run_old, run_new) if sample % 2 == 0 else (run_new, run_old)
+                for fn in order:
+                    started = time.perf_counter()
+                    fn()
+                    elapsed = time.perf_counter() - started
+                    if fn is run_old:
+                        old_samples.append(elapsed)
+                    else:
+                        new_samples.append(elapsed)
+
+            old_median = statistics.median(old_samples)
+            new_median = statistics.median(new_samples)
+            print(
+                "QWEN38_BONSAI2_SHARED_SCALES_REAL_GEOMETRY_PASS "
+                f"label={label} rows={rows} n={n} threads=4 "
+                f"old_median_seconds={old_median:.9f} "
+                f"shared_median_seconds={new_median:.9f} "
+                f"speedup={old_median / new_median:.4f}x "
+                f"old_samples={old_samples} "
+                f"shared_samples={new_samples}"
+            )
+    finally:
+        runtime.close()
 
 
 def main() -> None:
@@ -224,6 +339,8 @@ def main() -> None:
         print("QWEN38_BONSAI2_NATIVE_FFN_BITWISE_PASS")
     finally:
         runtime.close()
+
+    benchmark_shared_scales(lib_path)
 
 
 if __name__ == "__main__":

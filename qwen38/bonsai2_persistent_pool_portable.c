@@ -50,6 +50,7 @@ struct qwen_bonsai2_pool {
     float *out;
 
     int pair_mode;
+    int shared_scales_mode;
     const uint8_t *pair_weights1;
     size_t pair_rows0;
     size_t pair_rows1;
@@ -113,6 +114,26 @@ static int qwen_bonsai2_pool_compute(qwen_bonsai2_worker *w) {
     qwen_bonsai2_pool *p = w->pool;
     if (p->pair_mode) {
         return qwen_bonsai2_pool_compute_ptq1_pair(w);
+    }
+    if (p->shared_scales_mode &&
+        p->kind == QWEN_BONSAI2_KIND_PTQ1) {
+        const size_t begin =
+            p->rows * (size_t)w->ith / (size_t)p->n_threads;
+        const size_t end =
+            p->rows * (size_t)(w->ith + 1) / (size_t)p->n_threads;
+        const size_t row_bytes =
+            qwen_bonsai2_pool_row_bytes(QWEN_BONSAI2_KIND_PTQ1, p->n);
+        if (row_bytes == 0 || !p->ptq1_activation_scales) return -22;
+        for (size_t r = begin; r < end; ++r) {
+            p->out[r] =
+                qwen_bonsai2_vec_dot_ptq1_q8_0_fused_cached_scales(
+                    p->weights + r * row_bytes,
+                    p->activation,
+                    p->ptq1_activation_scales,
+                    p->n,
+                    p->ptq1_lut);
+        }
+        return 0;
     }
     const size_t begin = p->rows * (size_t)w->ith / (size_t)p->n_threads;
     const size_t end = p->rows * (size_t)(w->ith + 1) / (size_t)p->n_threads;
@@ -332,6 +353,91 @@ QWEN_EXPORT int qwen_bonsai2_pool_matvec_ptq1_0(
         opaque, QWEN_BONSAI2_KIND_PTQ1,
         weights, weights_bytes, rows, n,
         activation, activation_bytes, out);
+}
+
+
+QWEN_EXPORT int qwen_bonsai2_pool_matvec_ptq1_0_shared_scales(
+        void *opaque,
+        const uint8_t *weights, size_t weights_bytes, size_t rows, size_t n,
+        const uint8_t *activation, size_t activation_bytes, float *out) {
+    qwen_bonsai2_pool *p = (qwen_bonsai2_pool *)opaque;
+    if (!p || !weights || !activation || !out ||
+        rows == 0 || n == 0 || n % 128u != 0) return -1;
+    if (rows > p->max_rows) return -2;
+    const size_t row_bytes =
+        qwen_bonsai2_pool_row_bytes(QWEN_BONSAI2_KIND_PTQ1, n);
+    if (row_bytes == 0 || weights_bytes != rows * row_bytes) return -3;
+    const size_t q8_blocks = n / 32u;
+    const size_t expected_activation_bytes =
+        q8_blocks * QWEN_BLOCK_Q8_0;
+    if (activation_bytes != expected_activation_bytes) return -4;
+
+    float *activation_scales =
+        (float *)malloc(q8_blocks * sizeof(float));
+    if (!activation_scales) return -5;
+    for (size_t ib = 0; ib < q8_blocks; ++ib) {
+        activation_scales[ib] =
+            qwen_f16_to_f32(qwen_load_u16_le(
+                activation + ib * QWEN_BLOCK_Q8_0));
+    }
+
+    if (p->n_threads == 1) {
+        p->kind = QWEN_BONSAI2_KIND_PTQ1;
+        p->weights = weights;
+        p->weights_bytes = weights_bytes;
+        p->rows = rows;
+        p->n = n;
+        p->activation = activation;
+        p->activation_bytes = activation_bytes;
+        p->out = out;
+        p->ptq1_activation_scales = activation_scales;
+        p->shared_scales_mode = 1;
+        const int rc = qwen_bonsai2_pool_compute(&p->workers[0]);
+        p->shared_scales_mode = 0;
+        p->ptq1_activation_scales = NULL;
+        if (rc == 0) p->calls += 1;
+        free(activation_scales);
+        return rc;
+    }
+
+    qwen_mutex_lock(&p->mutex);
+    p->pair_mode = 0;
+    p->shared_scales_mode = 1;
+    p->kind = QWEN_BONSAI2_KIND_PTQ1;
+    p->weights = weights;
+    p->weights_bytes = weights_bytes;
+    p->rows = rows;
+    p->n = n;
+    p->activation = activation;
+    p->activation_bytes = activation_bytes;
+    p->out = out;
+    p->ptq1_activation_scales = activation_scales;
+    p->done_workers = 0;
+    for (int i = 0; i < p->n_threads; ++i) {
+        p->workers[i].rc = 0;
+    }
+    p->generation += 1;
+    qwen_cond_broadcast(&p->work_cond);
+    qwen_mutex_unlock(&p->mutex);
+
+    p->workers[0].rc =
+        qwen_bonsai2_pool_compute(&p->workers[0]);
+
+    qwen_mutex_lock(&p->mutex);
+    while (p->done_workers != p->n_threads - 1) {
+        qwen_cond_wait(&p->done_cond, &p->mutex);
+    }
+    qwen_mutex_unlock(&p->mutex);
+
+    int rc = p->workers[0].rc;
+    for (int i = 1; i < p->n_threads && rc == 0; ++i) {
+        if (p->workers[i].rc != 0) rc = p->workers[i].rc;
+    }
+    p->shared_scales_mode = 0;
+    p->ptq1_activation_scales = NULL;
+    if (rc == 0) p->calls += 1;
+    free(activation_scales);
+    return rc;
 }
 
 QWEN_EXPORT int qwen_bonsai2_pool_matvec_pq2_0(
