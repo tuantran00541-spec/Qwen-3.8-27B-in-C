@@ -345,7 +345,7 @@ QWEN_EXPORT int qwen_bonsai2_pool_matvec_pq2_0(
 }
 
 
-static int qwen_bonsai2_pool_matvec_ptq1_pair_cached(
+static int qwen_bonsai2_pool_matvec_ptq1_pair(
         qwen_bonsai2_pool *p,
         const uint8_t *weights0, size_t weights0_bytes, size_t rows0,
         const uint8_t *weights1, size_t weights1_bytes, size_t rows1,
@@ -359,8 +359,7 @@ static int qwen_bonsai2_pool_matvec_ptq1_pair_cached(
         return -1;
     }
     const size_t total_rows = rows0 + rows1;
-    if (total_rows < rows0 ||
-        rows0 > p->max_rows || rows1 > p->max_rows) return -2;
+    if (total_rows < rows0 || total_rows > p->max_rows) return -2;
     const size_t row_bytes =
         qwen_bonsai2_pool_row_bytes(QWEN_BONSAI2_KIND_PTQ1, n);
     if (row_bytes == 0) return -3;
@@ -424,42 +423,6 @@ static int qwen_bonsai2_pool_matvec_ptq1_pair_cached(
     }
     p->pair_mode = 0;
     if (rc == 0) p->calls += 1;
-    return rc;
-}
-
-QWEN_EXPORT int qwen_bonsai2_pool_matvec_ptq1_pair(
-        void *opaque,
-        const uint8_t *weights0, size_t weights0_bytes, size_t rows0,
-        const uint8_t *weights1, size_t weights1_bytes, size_t rows1,
-        size_t n,
-        const uint8_t *activation, size_t activation_bytes,
-        float *out0, float *out1) {
-    qwen_bonsai2_pool *p = (qwen_bonsai2_pool *)opaque;
-    if (!p || !activation || n == 0 || n % 128u != 0) return -1;
-    const size_t q8_blocks = n / 32u;
-    const size_t expected_activation_bytes =
-        q8_blocks * QWEN_BLOCK_Q8_0;
-    if (activation_bytes != expected_activation_bytes) return -5;
-
-    float *activation_scales =
-        (float *)malloc(q8_blocks * sizeof(float));
-    if (!activation_scales) return -6;
-    for (size_t ib = 0; ib < q8_blocks; ++ib) {
-        const uint8_t *ab =
-            activation + ib * QWEN_BLOCK_Q8_0;
-        activation_scales[ib] =
-            qwen_f16_to_f32(qwen_load_u16_le(ab));
-    }
-
-    const int rc = qwen_bonsai2_pool_matvec_ptq1_pair_cached(
-        p,
-        weights0, weights0_bytes, rows0,
-        weights1, weights1_bytes, rows1,
-        n,
-        activation, activation_bytes,
-        activation_scales,
-        out0, out1);
-    free(activation_scales);
     return rc;
 }
 
@@ -536,7 +499,7 @@ QWEN_EXPORT int qwen_bonsai2_pool_recurrent_projections_ptq1_bf16(
             qwen_f16_to_f32(qwen_load_u16_le(ab));
     }
 
-    rc = qwen_bonsai2_pool_matvec_ptq1_pair_cached(
+    rc = qwen_bonsai2_pool_matvec_ptq1_pair(
         p,
         qkv_weights, qkv_bytes, qkv_rows,
         gate_weights, gate_bytes, gate_rows,
@@ -618,14 +581,16 @@ QWEN_EXPORT int qwen_bonsai2_pool_ffn_ptq1_0(
         p->scratch0, hidden, p->scratch_q8, hidden_q8);
     if (rc != 0) return -20 + rc;
 
-    rc = qwen_bonsai2_pool_matvec_ptq1_pair(
-        p,
-        gate_weights, gate_bytes, intermediate,
-        up_weights, up_bytes, intermediate,
-        hidden,
-        p->scratch_q8, hidden_q8,
-        p->scratch0, p->scratch1);
+    rc = qwen_bonsai2_pool_matvec(
+        p, QWEN_BONSAI2_KIND_PTQ1,
+        gate_weights, gate_bytes, intermediate, hidden,
+        p->scratch_q8, hidden_q8, p->scratch0);
     if (rc != 0) return -30 + rc;
+    rc = qwen_bonsai2_pool_matvec(
+        p, QWEN_BONSAI2_KIND_PTQ1,
+        up_weights, up_bytes, intermediate, hidden,
+        p->scratch_q8, hidden_q8, p->scratch1);
+    if (rc != 0) return -40 + rc;
 
     rc = qwen_bonsai2_swiglu_f32(
         p->scratch0, p->scratch1, intermediate, p->scratch0);
