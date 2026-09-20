@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import ctypes
 from pathlib import Path
+import statistics
 import struct
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "qwen38"))
@@ -14,6 +16,8 @@ import bonsai2_two_token as t2
 
 HIDDEN = 256
 INTERMEDIATE = 512
+REAL_HIDDEN = 5120
+REAL_INTERMEDIATE = 17408
 BLOCK = 128
 FP = ctypes.POINTER(ctypes.c_float)
 U8P = ctypes.POINTER(ctypes.c_uint8)
@@ -119,6 +123,121 @@ def verify_t2_ffn_delegates_once() -> None:
         raise AssertionError(f"expected one native FFN delegation, got {runtime.calls}")
 
 
+
+def repeated_ptq1_weights(rows: int, n: int, seed: int) -> bytearray:
+    if n % 128:
+        raise AssertionError(n)
+    rng = RNG(seed)
+    block = bytearray((rng.u32() & 0xFF) for _ in range(26))
+    block.extend(struct.pack("<e", (0.125, 0.25, 0.5, 1.0)[rng.u32() % 4]))
+    return bytearray(block * (rows * (n // 128)))
+
+
+def real_geometry_pair_benchmark(lib_path: Path) -> None:
+    runtime = Bonsai2NativeRuntime(
+        lib_path, metadata(), threads=4, max_rows=REAL_INTERMEDIATE
+    )
+    try:
+        single = runtime.lib.qwen_bonsai2_pool_matvec_ptq1_0
+        pair = runtime.lib.qwen_bonsai2_pool_matvec_ptq1_pair
+        pair.argtypes = [
+            ctypes.c_void_p,
+            U8P, ctypes.c_size_t, ctypes.c_size_t,
+            U8P, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_size_t,
+            U8P, ctypes.c_size_t,
+            FP, FP,
+        ]
+        pair.restype = ctypes.c_int
+
+        gate_w = repeated_ptq1_weights(
+            REAL_INTERMEDIATE, REAL_HIDDEN, 0xFF001
+        )
+        up_w = repeated_ptq1_weights(
+            REAL_INTERMEDIATE, REAL_HIDDEN, 0xFF002
+        )
+        gate_buf = (ctypes.c_uint8 * len(gate_w)).from_buffer(gate_w)
+        up_buf = (ctypes.c_uint8 * len(up_w)).from_buffer(up_w)
+
+        x = [((i % 257) - 128) / 128.0 for i in range(REAL_HIDDEN)]
+        activation, activation_bytes = runtime.prepare_activation(
+            "blk.0.ffn_gate.weight", x
+        )
+
+        baseline_gate = (ctypes.c_float * REAL_INTERMEDIATE)()
+        baseline_up = (ctypes.c_float * REAL_INTERMEDIATE)()
+        paired_gate = (ctypes.c_float * REAL_INTERMEDIATE)()
+        paired_up = (ctypes.c_float * REAL_INTERMEDIATE)()
+
+        def run_baseline() -> None:
+            rc0 = single(
+                runtime.pool,
+                gate_buf, len(gate_w), REAL_INTERMEDIATE, REAL_HIDDEN,
+                activation, activation_bytes, baseline_gate,
+            )
+            rc1 = single(
+                runtime.pool,
+                up_buf, len(up_w), REAL_INTERMEDIATE, REAL_HIDDEN,
+                activation, activation_bytes, baseline_up,
+            )
+            if rc0 != 0 or rc1 != 0:
+                raise AssertionError(
+                    f"real geometry baseline rc0={rc0} rc1={rc1}"
+                )
+
+        def run_pair() -> None:
+            rc = pair(
+                runtime.pool,
+                gate_buf, len(gate_w), REAL_INTERMEDIATE,
+                up_buf, len(up_w), REAL_INTERMEDIATE,
+                REAL_HIDDEN,
+                activation, activation_bytes,
+                paired_gate, paired_up,
+            )
+            if rc != 0:
+                raise AssertionError(f"real geometry pair rc={rc}")
+
+        run_baseline()
+        run_pair()
+        if (
+            bytes(memoryview(baseline_gate).cast("B"))
+            != bytes(memoryview(paired_gate).cast("B"))
+            or bytes(memoryview(baseline_up).cast("B"))
+            != bytes(memoryview(paired_up).cast("B"))
+        ):
+            raise AssertionError(
+                "real geometry PTQ1 pair is not bitwise identical"
+            )
+
+        baseline_samples: list[float] = []
+        pair_samples: list[float] = []
+        for i in range(4):
+            order = (run_baseline, run_pair) if i % 2 == 0 else (run_pair, run_baseline)
+            for fn in order:
+                started = time.perf_counter()
+                fn()
+                elapsed = time.perf_counter() - started
+                if fn is run_baseline:
+                    baseline_samples.append(elapsed)
+                else:
+                    pair_samples.append(elapsed)
+
+        baseline_median = statistics.median(baseline_samples)
+        pair_median = statistics.median(pair_samples)
+        speedup = baseline_median / pair_median
+        print(
+            "QWEN38_BONSAI2_FFN_PAIR_REAL_GEOMETRY_PASS "
+            f"hidden={REAL_HIDDEN} intermediate={REAL_INTERMEDIATE} threads=4 "
+            f"baseline_median_seconds={baseline_median:.6f} "
+            f"pair_median_seconds={pair_median:.6f} "
+            f"speedup={speedup:.4f}x "
+            f"baseline_samples={baseline_samples} "
+            f"pair_samples={pair_samples}"
+        )
+    finally:
+        runtime.close()
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("usage: test_bonsai2_native_ffn.py LIB")
@@ -222,6 +341,7 @@ def main() -> None:
 
         verify_t2_ffn_delegates_once()
         print("QWEN38_BONSAI2_NATIVE_FFN_BITWISE_PASS")
+        real_geometry_pair_benchmark(lib_path)
     finally:
         runtime.close()
 
