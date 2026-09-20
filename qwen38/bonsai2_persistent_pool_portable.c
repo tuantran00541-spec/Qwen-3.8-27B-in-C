@@ -687,13 +687,13 @@ QWEN_EXPORT int qwen_bonsai2_pool_ffn_ptq1_0(
         p->scratch0, hidden, p->scratch_q8, hidden_q8);
     if (rc != 0) return -20 + rc;
 
-    rc = qwen_bonsai2_pool_matvec(
-        p, QWEN_BONSAI2_KIND_PTQ1,
+    rc = qwen_bonsai2_pool_matvec_ptq1_0_shared_scales(
+        p,
         gate_weights, gate_bytes, intermediate, hidden,
         p->scratch_q8, hidden_q8, p->scratch0);
     if (rc != 0) return -30 + rc;
-    rc = qwen_bonsai2_pool_matvec(
-        p, QWEN_BONSAI2_KIND_PTQ1,
+    rc = qwen_bonsai2_pool_matvec_ptq1_0_shared_scales(
+        p,
         up_weights, up_bytes, intermediate, hidden,
         p->scratch_q8, hidden_q8, p->scratch1);
     if (rc != 0) return -40 + rc;
@@ -710,8 +710,8 @@ QWEN_EXPORT int qwen_bonsai2_pool_ffn_ptq1_0(
         p->scratch_q8, intermediate_q8);
     if (rc != 0) return -70 + rc;
 
-    rc = qwen_bonsai2_pool_matvec(
-        p, QWEN_BONSAI2_KIND_PTQ1,
+    rc = qwen_bonsai2_pool_matvec_ptq1_0_shared_scales(
+        p,
         down_weights, down_bytes, hidden, intermediate,
         p->scratch_q8, intermediate_q8, out);
     if (rc != 0) return -80 + rc;
