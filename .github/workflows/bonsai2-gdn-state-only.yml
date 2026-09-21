@@ -1,4 +1,4 @@
-name: Bonsai 2 GDN state-only context probe
+name: Bonsai 2 tiny attention tail sweep
 
 on:
   push:
@@ -13,9 +13,15 @@ permissions:
   contents: read
 
 jobs:
-  context-probe:
+  tail-probe:
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        tail: [0, 1, 2, 4, 8, 16, 32, 64]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+
     steps:
       - uses: actions/checkout@v4
 
@@ -27,9 +33,15 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p work/context-probe
-          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared             qwen38/bonsai2_persistent_pool_portable.c             -pthread -lm             -o work/context-probe/libbonsai2_quant.so
-          gcc -O3 -std=c11 -fPIC -shared             qwen38/gdn_state_ar_portable_pool.c             -pthread -lm             -o work/context-probe/libgdn_state.so
+          mkdir -p work/tail-${{ matrix.tail }}
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared \
+            qwen38/bonsai2_persistent_pool_portable.c \
+            -pthread -lm \
+            -o work/tail-${{ matrix.tail }}/libbonsai2_quant.so
+          gcc -O3 -std=c11 -fPIC -shared \
+            qwen38/gdn_state_ar_portable_pool.c \
+            -pthread -lm \
+            -o work/tail-${{ matrix.tail }}/libgdn_state.so
           python -m pip install --disable-pip-version-check tokenizers
           python -m py_compile qwen38/bonsai2_prompt_spike.py
 
@@ -52,58 +64,61 @@ jobs:
           echo "$TOKENIZER_SHA  $TOKENIZER.part" | sha256sum -c -
           mv "$TOKENIZER.part" "$TOKENIZER"
 
-      - name: Run baseline and GDN-state-only decode
+      - name: Run context retention probe
         shell: bash
         run: |
           set -euxo pipefail
+          TAIL="${{ matrix.tail }}"
           PROMPT='Memorize these two facts: codeword is MARBLE-731; 6 boxes times 4 pens minus 7 pens equals 17. Output exactly two lines and nothing else. Line 1: Codeword: MARBLE-731. Line 2: Result: 17 pens.'
+          EXTRA=()
+          if [ "$TAIL" -gt 0 ]; then
+            EXTRA=(--attention-tail-tokens "$TAIL")
+          fi
 
-          mkdir -p work/context-probe/baseline-k3 work/context-probe/state-only-k3
+          mkdir -p "work/tail-$TAIL/k3"
+          python qwen38/bonsai2_prompt_spike.py \
+            --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+            --native-lib "work/tail-$TAIL/libbonsai2_quant.so" \
+            --state-lib "work/tail-$TAIL/libgdn_state.so" \
+            --tokenizer-json models/qwen-official/tokenizer.json \
+            --prompt "$PROMPT" \
+            --max-new-tokens 32 \
+            --threads 4 \
+            --resident-decoder \
+            --no-json-events \
+            "${EXTRA[@]}" \
+            --work-dir "work/tail-$TAIL/k3" \
+            --output "work/tail-$TAIL/result.json"
 
-          python qwen38/bonsai2_prompt_spike.py             --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf             --native-lib work/context-probe/libbonsai2_quant.so             --state-lib work/context-probe/libgdn_state.so             --tokenizer-json models/qwen-official/tokenizer.json             --prompt "$PROMPT"             --max-new-tokens 32             --threads 4             --resident-decoder             --no-json-events             --work-dir work/context-probe/baseline-k3             --output work/context-probe/baseline.json
-
-          python qwen38/bonsai2_prompt_spike.py             --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf             --native-lib work/context-probe/libbonsai2_quant.so             --state-lib work/context-probe/libgdn_state.so             --tokenizer-json models/qwen-official/tokenizer.json             --prompt "$PROMPT"             --max-new-tokens 32             --threads 4             --resident-decoder             --state-only-decode             --no-json-events             --work-dir work/context-probe/state-only-k3             --output work/context-probe/state-only.json
-
-      - name: Compare context retention
+      - name: Print retention summary
         shell: bash
         run: |
           set -euxo pipefail
-          python - <<'PY'
+          TAIL="${{ matrix.tail }}"
+          python - "$TAIL" <<'PY'
           import json
+          import sys
           from pathlib import Path
 
-          base = json.loads(Path("work/context-probe/baseline.json").read_text())
-          state = json.loads(Path("work/context-probe/state-only.json").read_text())
-
-          a = base["generated_token_ids"]
-          b = state["generated_token_ids"]
-          common = 0
-          for x, y in zip(a, b):
-              if x != y:
-                  break
-              common += 1
-
-          text = state["generated_text"]
+          tail = int(sys.argv[1])
+          p = Path(f"work/tail-{tail}/result.json")
+          d = json.loads(p.read_text())
+          generated = d["generated_text"]
           report = {
-              "baseline_text": base["generated_text"],
-              "state_only_text": text,
-              "baseline_tokens": len(a),
-              "state_only_tokens": len(b),
-              "common_prefix_tokens": common,
-              "first_divergence_index": None if common == min(len(a), len(b)) and len(a) == len(b) else common,
-              "prompt_attention_rows_dropped": state["dropped_prompt_attention_rows"],
-              "state_only_attention_kv_bytes_end": state["state"]["attention_kv_bytes_f16"],
-              "retained_codeword": "MARBLE-731" in text,
-              "retained_arithmetic": "17" in text,
-              "state_only_stop_reason": state["stop_reason"],
-              "state_only_tokens_per_second": state["timing"]["tokens_per_second"],
-              "state_only_max_rss_gib": state["max_rss_gib"],
+              "tail_tokens": None if tail == 0 else tail,
+              "baseline": tail == 0,
+              "generated_text": generated,
+              "retained_codeword": "MARBLE-731" in generated,
+              "retained_arithmetic": "17" in generated,
+              "stop_reason": d["stop_reason"],
+              "prompt_attention_rows_dropped": d["dropped_prompt_attention_rows"],
+              "attention_kv_bytes_end": d["state"]["attention_kv_bytes_f16"],
+              "tokens_per_second": d["timing"]["tokens_per_second"],
+              "max_rss_gib": d["max_rss_gib"],
           }
-          Path("work/context-probe/comparison.json").write_text(
-              json.dumps(report, indent=2, ensure_ascii=False) + "\n"
-          )
-          print(json.dumps(report, indent=2, ensure_ascii=False))
-          print("QWEN38_BONSAI2_GDN_STATE_ONLY_PROBE_PASS")
+          out = Path(f"work/tail-{tail}/summary.json")
+          out.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+          print("TAIL_SWEEP_RESULT=" + json.dumps(report, ensure_ascii=False))
           PY
 
       - name: Drop large files
@@ -111,15 +126,15 @@ jobs:
         shell: bash
         run: |
           rm -rf models/bonsai2 models/qwen-official
-          rm -f work/context-probe/baseline-k3/decoder64.k3.bin
-          rm -f work/context-probe/state-only-k3/decoder64.k3.bin
+          rm -f work/tail-${{ matrix.tail }}/k3/decoder64.k3.bin
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bonsai2-gdn-state-only-probe
+          name: bonsai2-tail-${{ matrix.tail }}
           path: |
-            work/context-probe/*.json
+            work/tail-${{ matrix.tail }}/result.json
+            work/tail-${{ matrix.tail }}/summary.json
           if-no-files-found: warn
           retention-days: 30
