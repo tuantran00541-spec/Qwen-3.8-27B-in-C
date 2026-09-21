@@ -5,6 +5,12 @@ on:
     branches:
       - test/bonsai2-27b
     paths:
+      - qwen38/bonsai2_persistent_pool_portable.c
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - qwen38/gdn_state_ar_portable_pool.c
+      - qwen38/qwen_thread_compat.h
+      - qwen38/bonsai2_quant_runtime.py
+      - qwen38/bonsai2_prompt_spike.py
       - qwen38/gguf_stream.py
       - scripts/setup_bonsai2.ps1
       - scripts/bench_bonsai2.ps1
@@ -52,6 +58,40 @@ jobs:
         run: |
           python -m py_compile qwen38\gguf_stream.py scripts\bonsai2_inventory.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build and run native MSVC release smoke
+        shell: cmd
+        run: |
+          @echo on
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL exit /b 1
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b %errorlevel%
+          if not exist work\bonsai2 mkdir work\bonsai2
+
+          cl /nologo /O2 /TC /std:c11 /arch:AVX2 /DQWEN_BONSAI2_PORTABLE_POOL_SELFTEST qwen38\bonsai2_persistent_pool_portable.c /Fe:work\bonsai2\bonsai2_pool_selftest.exe
+          if errorlevel 1 exit /b %errorlevel%
+          work\bonsai2\bonsai2_pool_selftest.exe > work\bonsai2\native-pool-selftest.txt
+          if errorlevel 1 exit /b %errorlevel%
+          type work\bonsai2\native-pool-selftest.txt
+          findstr /x /c:"QWEN38_BONSAI2_PORTABLE_POOL_PASS" work\bonsai2\native-pool-selftest.txt
+          if errorlevel 1 exit /b 1
+
+          cl /nologo /O2 /TC /std:c11 /arch:AVX2 /DQWEN_GDN_PORTABLE_POOL_SELFTEST qwen38\gdn_state_ar_portable_pool.c /Fe:work\bonsai2\gdn_pool_selftest.exe
+          if errorlevel 1 exit /b %errorlevel%
+          work\bonsai2\gdn_pool_selftest.exe > work\bonsai2\gdn-pool-selftest.txt
+          if errorlevel 1 exit /b %errorlevel%
+          type work\bonsai2\gdn-pool-selftest.txt
+          findstr /x /c:"QWEN38_GDN_PORTABLE_POOL_BITWISE_PASS" work\bonsai2\gdn-pool-selftest.txt
+          if errorlevel 1 exit /b 1
+
+          cl /nologo /O2 /TC /std:c11 /arch:AVX2 /LD qwen38\bonsai2_persistent_pool_portable.c /Fe:work\bonsai2\bonsai2_quant.dll
+          if errorlevel 1 exit /b %errorlevel%
+          cl /nologo /O2 /TC /std:c11 /arch:AVX2 /LD qwen38\gdn_state_ar_portable_pool.c /Fe:work\bonsai2\gdn_state.dll
+          if errorlevel 1 exit /b %errorlevel%
+          if not exist work\bonsai2\bonsai2_quant.dll exit /b 1
+          if not exist work\bonsai2\gdn_state.dll exit /b 1
+          echo QWEN38_BONSAI2_WINDOWS_NATIVE_MSVC_PASS
 
       - name: Download pinned Prism CPU runtime and PTQ1_0 model
         shell: pwsh

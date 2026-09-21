@@ -5,6 +5,12 @@ on:
     branches:
       - test/bonsai2-27b
     paths:
+      - qwen38/bonsai2_persistent_pool_portable.c
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - qwen38/gdn_state_ar_portable_pool.c
+      - qwen38/qwen_thread_compat.h
+      - qwen38/bonsai2_quant_runtime.py
+      - qwen38/bonsai2_prompt_spike.py
       - .github/workflows/bonsai2-math-prompt.yml
   workflow_dispatch:
 
@@ -98,16 +104,20 @@ jobs:
           import json
           from pathlib import Path
           p = Path("work/bonsai2-math/math-result.json")
-          if p.exists():
-              d = json.loads(p.read_text())
-              print("EXPECTED_FINAL_ANSWER=19")
-              print("GENERATED_TEXT=" + d.get("generated_text", "").replace("\n", "\\n"))
-              print("PROMPT_TOKENS=" + str(d.get("prompt_token_count")))
-              print("GENERATED_TOKENS=" + str(len(d.get("generated_token_ids", []))))
-              print("TIMING=" + json.dumps(d.get("timing", {}), sort_keys=True))
-              print("MAX_RSS_GIB=" + str(d.get("max_rss_gib")))
-          else:
-              print("math-result.json missing")
+          if not p.exists():
+              raise SystemExit("math-result.json missing")
+          d = json.loads(p.read_text())
+          generated = d.get("generated_text", "")
+          print("EXPECTED_FINAL_ANSWER=19")
+          print("GENERATED_TEXT=" + generated.replace("\n", "\\n"))
+          print("PROMPT_TOKENS=" + str(d.get("prompt_token_count")))
+          print("GENERATED_TOKENS=" + str(len(d.get("generated_token_ids", []))))
+          print("TIMING=" + json.dumps(d.get("timing", {}), sort_keys=True))
+          print("MAX_RSS_GIB=" + str(d.get("max_rss_gib")))
+          import re
+          if re.search(r"(?<!\\d)19(?!\\d)", generated) is None:
+              raise SystemExit("math validation failed: expected answer 19 not found")
+          print("QWEN38_BONSAI2_REAL_MATH_VALIDATION_PASS")
           PY
 
       - name: Drop large files

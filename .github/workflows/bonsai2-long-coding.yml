@@ -5,6 +5,12 @@ on:
     branches:
       - test/bonsai2-27b
     paths:
+      - qwen38/bonsai2_persistent_pool_portable.c
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - qwen38/gdn_state_ar_portable_pool.c
+      - qwen38/qwen_thread_compat.h
+      - qwen38/bonsai2_quant_runtime.py
+      - qwen38/bonsai2_prompt_spike.py
       - .github/workflows/bonsai2-long-coding.yml
   workflow_dispatch:
 
