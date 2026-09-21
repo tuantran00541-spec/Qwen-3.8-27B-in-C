@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p work/bonsai2-math/k3
-          PROMPT='A class has 40 students. 60% passed Mathematics, 75% passed English, and 5 students failed both subjects. How many students passed both subjects? Respond in at most 3 lines: one short calculation and then a final line in the form "Final answer: N students".'
+          PROMPT='A class has 40 students. 60% passed Mathematics, 75% passed English, and 5 students failed both subjects. Output exactly two lines and nothing else. Line 1: Calculation: <one compact arithmetic expression>. Line 2: Final answer: <N> students.'
           /usr/bin/time -v python qwen38/bonsai2_prompt_spike.py \
             --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
             --native-lib work/bonsai2-math/libbonsai2_quant.so \
