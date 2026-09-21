@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p work/bonsai2-math/k3
-          PROMPT='A class has 40 students. 60% passed Mathematics, 75% passed English, and 5 students failed both subjects. How many students passed both subjects? Show a short calculation and then give the final answer.'
+          PROMPT='A class has 40 students. 60% passed Mathematics, 75% passed English, and 5 students failed both subjects. How many students passed both subjects? Respond in at most 3 lines: one short calculation and then a final line in the form "Final answer: N students".'
           /usr/bin/time -v python qwen38/bonsai2_prompt_spike.py \
             --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
             --native-lib work/bonsai2-math/libbonsai2_quant.so \
@@ -114,9 +114,10 @@ jobs:
           print("GENERATED_TOKENS=" + str(len(d.get("generated_token_ids", []))))
           print("TIMING=" + json.dumps(d.get("timing", {}), sort_keys=True))
           print("MAX_RSS_GIB=" + str(d.get("max_rss_gib")))
-          import re
-          if re.search(r"(?<!\\d)19(?!\\d)", generated) is None:
-              raise SystemExit("math validation failed: expected answer 19 not found")
+          if "Final answer: 19" not in generated:
+              raise SystemExit(
+                  "math validation failed: expected 'Final answer: 19'"
+              )
           print("QWEN38_BONSAI2_REAL_MATH_VALIDATION_PASS")
           PY
 
