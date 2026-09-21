@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p work/bonsai2-math/k3
-          PROMPT='A class has 40 students. 60% passed Mathematics, 75% passed English, and 5 students failed both subjects. Output exactly two lines and nothing else. Line 1: Calculation: <one compact arithmetic expression>. Line 2: Final answer: <N> students.'
+          PROMPT='There are 3 boxes with 7 pencils in each box. Then 5 pencils are given away. How many pencils remain? Output exactly two lines and nothing else. Line 1: Calculation: <one compact arithmetic expression>. Line 2: Final answer: <N> pencils.'
           /usr/bin/time -v python qwen38/bonsai2_prompt_spike.py \
             --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
             --native-lib work/bonsai2-math/libbonsai2_quant.so \
@@ -108,15 +108,15 @@ jobs:
               raise SystemExit("math-result.json missing")
           d = json.loads(p.read_text())
           generated = d.get("generated_text", "")
-          print("EXPECTED_FINAL_ANSWER=19")
+          print("EXPECTED_FINAL_ANSWER=16")
           print("GENERATED_TEXT=" + generated.replace("\n", "\\n"))
           print("PROMPT_TOKENS=" + str(d.get("prompt_token_count")))
           print("GENERATED_TOKENS=" + str(len(d.get("generated_token_ids", []))))
           print("TIMING=" + json.dumps(d.get("timing", {}), sort_keys=True))
           print("MAX_RSS_GIB=" + str(d.get("max_rss_gib")))
-          if "Final answer: 19" not in generated:
+          if "Final answer: 16" not in generated:
               raise SystemExit(
-                  "math validation failed: expected 'Final answer: 19'"
+                  "math validation failed: expected 'Final answer: 16'"
               )
           print("QWEN38_BONSAI2_REAL_MATH_VALIDATION_PASS")
           PY
