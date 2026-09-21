@@ -449,6 +449,18 @@ class StatefulBonsai2Generator:
         self.position += 1
         return hidden
 
+    def drop_attention_kv(self) -> int:
+        """Drop all full-attention history while preserving GDN recurrent state."""
+        dropped_rows = 0
+        for cache in self.caches.values():
+            dropped_rows += len(cache["k"])
+            cache["k"].clear()
+            cache["v"].clear()
+        # The native runtime mirrors Python K/V rows in a flattened cache.
+        # Clearing both sides is required before rebuilding a one-token cache.
+        self.runtime._attention_cache.clear()
+        return dropped_rows
+
     def logits(self, hidden: Sequence[float]) -> list[float]:
         section_started = time.perf_counter()
         normalized = self.runtime.rms_norm(hidden, self.output_norm, eps=gdn.RMS_EPS)
@@ -520,6 +532,7 @@ def run(
     expected_text: str | None = None,
     stream_text: bool = False,
     json_events: bool = True,
+    state_only_decode: bool = False,
 ) -> dict[str, Any]:
     started = time.monotonic()
     tokenizer = textgen.load_tokenizer(tokenizer_json)
@@ -559,6 +572,17 @@ def run(
                 }), flush=True)
         assert hidden is not None
 
+        dropped_prompt_attention_rows = 0
+        if state_only_decode:
+            dropped_prompt_attention_rows = engine.drop_attention_kv()
+            if json_events:
+                print(json.dumps({
+                    "phase": "state_only_reset",
+                    "dropped_attention_rows": dropped_prompt_attention_rows,
+                    "gdn_state_preserved": True,
+                    "conv_history_preserved": True,
+                }), flush=True)
+
         generation_started = time.monotonic()
         generation_profile_before = engine.profile_snapshot()
         first_token_seconds: float | None = None
@@ -591,6 +615,8 @@ def run(
             eos = token_id in EOS_IDS
             includes_next_decoder_step = False
             if not eos and index + 1 < max_new_tokens:
+                if state_only_decode:
+                    engine.drop_attention_kv()
                 t1 = time.monotonic()
                 hidden = engine.step(token_id)
                 decode_seconds.append(time.monotonic() - t1)
@@ -657,6 +683,8 @@ def run(
             "completion_truncated": stop_reason == "max_new_tokens",
             "threads": threads,
             "resident_decoder": resident_decoder,
+            "state_only_decode": state_only_decode,
+            "dropped_prompt_attention_rows": dropped_prompt_attention_rows,
             "timing": {
                 "prefill_total_seconds": sum(prefill_seconds),
                 "prefill_mean_seconds_per_token": (
@@ -688,6 +716,8 @@ def run(
             "expected_text": expected_text,
             "exact_text_match": exact_text_match,
             "stop_reason": result["stop_reason"],
+            "state_only_decode": result["state_only_decode"],
+            "dropped_prompt_attention_rows": result["dropped_prompt_attention_rows"],
             "decode_critical_path": result["decode_critical_path"],
             "timing": result["timing"],
             "state": result["state"],
@@ -714,6 +744,11 @@ def main() -> None:
     ap.add_argument("--expected-text")
     ap.add_argument("--stream-text", action="store_true")
     ap.add_argument("--no-json-events", action="store_true")
+    ap.add_argument(
+        "--state-only-decode",
+        action="store_true",
+        help="drop full-attention KV after prefill and before each decode step",
+    )
     ap.add_argument("--work-dir", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
     args = ap.parse_args()
@@ -731,6 +766,7 @@ def main() -> None:
         args.expected_text,
         args.stream_text,
         not args.no_json_events,
+        args.state_only_decode,
     )
 
 
