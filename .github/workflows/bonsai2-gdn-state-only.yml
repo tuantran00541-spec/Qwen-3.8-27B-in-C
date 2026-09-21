@@ -1,4 +1,4 @@
-name: Bonsai 2 tiny attention tail sweep
+name: Bonsai 2 tiny attention tail frontier
 
 on:
   push:
@@ -13,12 +13,12 @@ permissions:
   contents: read
 
 jobs:
-  tail-probe:
+  frontier:
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: 6
       matrix:
-        tail: [0, 1, 2, 4, 8, 16, 32, 64]
+        tail: [20, 24, 28, 30, 31, 32]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
@@ -33,15 +33,15 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p work/tail-${{ matrix.tail }}
+          mkdir -p work/frontier-${{ matrix.tail }}
           gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared \
             qwen38/bonsai2_persistent_pool_portable.c \
             -pthread -lm \
-            -o work/tail-${{ matrix.tail }}/libbonsai2_quant.so
+            -o work/frontier-${{ matrix.tail }}/libbonsai2_quant.so
           gcc -O3 -std=c11 -fPIC -shared \
             qwen38/gdn_state_ar_portable_pool.c \
             -pthread -lm \
-            -o work/tail-${{ matrix.tail }}/libgdn_state.so
+            -o work/frontier-${{ matrix.tail }}/libgdn_state.so
           python -m pip install --disable-pip-version-check tokenizers
           python -m py_compile qwen38/bonsai2_prompt_spike.py
 
@@ -64,33 +64,29 @@ jobs:
           echo "$TOKENIZER_SHA  $TOKENIZER.part" | sha256sum -c -
           mv "$TOKENIZER.part" "$TOKENIZER"
 
-      - name: Run context retention probe
+      - name: Run frontier probe
         shell: bash
         run: |
           set -euxo pipefail
           TAIL="${{ matrix.tail }}"
           PROMPT='Memorize these two facts: codeword is MARBLE-731; 6 boxes times 4 pens minus 7 pens equals 17. Output exactly two lines and nothing else. Line 1: Codeword: MARBLE-731. Line 2: Result: 17 pens.'
-          EXTRA=()
-          if [ "$TAIL" -gt 0 ]; then
-            EXTRA=(--attention-tail-tokens "$TAIL")
-          fi
+          mkdir -p "work/frontier-$TAIL/k3"
 
-          mkdir -p "work/tail-$TAIL/k3"
           python qwen38/bonsai2_prompt_spike.py \
             --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
-            --native-lib "work/tail-$TAIL/libbonsai2_quant.so" \
-            --state-lib "work/tail-$TAIL/libgdn_state.so" \
+            --native-lib "work/frontier-$TAIL/libbonsai2_quant.so" \
+            --state-lib "work/frontier-$TAIL/libgdn_state.so" \
             --tokenizer-json models/qwen-official/tokenizer.json \
             --prompt "$PROMPT" \
             --max-new-tokens 32 \
             --threads 4 \
             --resident-decoder \
+            --attention-tail-tokens "$TAIL" \
             --no-json-events \
-            "${EXTRA[@]}" \
-            --work-dir "work/tail-$TAIL/k3" \
-            --output "work/tail-$TAIL/result.json"
+            --work-dir "work/frontier-$TAIL/k3" \
+            --output "work/frontier-$TAIL/result.json"
 
-      - name: Print retention summary
+      - name: Print frontier summary
         shell: bash
         run: |
           set -euxo pipefail
@@ -101,24 +97,25 @@ jobs:
           from pathlib import Path
 
           tail = int(sys.argv[1])
-          p = Path(f"work/tail-{tail}/result.json")
-          d = json.loads(p.read_text())
+          d = json.loads(Path(f"work/frontier-{tail}/result.json").read_text())
           generated = d["generated_text"]
           report = {
-              "tail_tokens": None if tail == 0 else tail,
-              "baseline": tail == 0,
+              "tail_tokens": tail,
               "generated_text": generated,
+              "exact_expected": generated.strip() == "Codeword: MARBLE-731\nResult: 17 pens<|im_end|>",
               "retained_codeword": "MARBLE-731" in generated,
               "retained_arithmetic": "17" in generated,
               "stop_reason": d["stop_reason"],
+              "prompt_token_count": d["prompt_token_count"],
               "prompt_attention_rows_dropped": d["dropped_prompt_attention_rows"],
               "attention_kv_bytes_end": d["state"]["attention_kv_bytes_f16"],
               "tokens_per_second": d["timing"]["tokens_per_second"],
               "max_rss_gib": d["max_rss_gib"],
           }
-          out = Path(f"work/tail-{tail}/summary.json")
-          out.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
-          print("TAIL_SWEEP_RESULT=" + json.dumps(report, ensure_ascii=False))
+          Path(f"work/frontier-{tail}/summary.json").write_text(
+              json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+          )
+          print("FRONTIER_RESULT=" + json.dumps(report, ensure_ascii=False))
           PY
 
       - name: Drop large files
@@ -126,15 +123,168 @@ jobs:
         shell: bash
         run: |
           rm -rf models/bonsai2 models/qwen-official
-          rm -f work/tail-${{ matrix.tail }}/k3/decoder64.k3.bin
+          rm -f work/frontier-${{ matrix.tail }}/k3/decoder64.k3.bin
 
-      - name: Upload evidence
+      - name: Upload frontier evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: bonsai2-tail-${{ matrix.tail }}
+          name: bonsai2-frontier-${{ matrix.tail }}
           path: |
-            work/tail-${{ matrix.tail }}/result.json
-            work/tail-${{ matrix.tail }}/summary.json
+            work/frontier-${{ matrix.tail }}/result.json
+            work/frontier-${{ matrix.tail }}/summary.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  long-context-1k-tail32:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build native runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/long-1k
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared \
+            qwen38/bonsai2_persistent_pool_portable.c \
+            -pthread -lm \
+            -o work/long-1k/libbonsai2_quant.so
+          gcc -O3 -std=c11 -fPIC -shared \
+            qwen38/gdn_state_ar_portable_pool.c \
+            -pthread -lm \
+            -o work/long-1k/libgdn_state.so
+          python -m pip install --disable-pip-version-check tokenizers
+          python -m py_compile qwen38/bonsai2_prompt_spike.py
+
+      - name: Download pinned model and tokenizer
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p models/bonsai2 models/qwen-official
+          MODEL="models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+          MODEL_URL="https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/6ed5e12bf84b7a63069882c91dd9e9218647d17b/Ternary-Bonsai-2-27B-PTQ1_0.gguf?download=true"
+          MODEL_SHA="53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"
+          curl -fL --retry 10 --retry-all-errors -C - -o "$MODEL.part" "$MODEL_URL"
+          echo "$MODEL_SHA  $MODEL.part" | sha256sum -c -
+          mv "$MODEL.part" "$MODEL"
+
+          TOKENIZER="models/qwen-official/tokenizer.json"
+          TOKENIZER_URL="https://huggingface.co/Qwen/Qwen3.8-27B/resolve/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/tokenizer.json?download=true"
+          TOKENIZER_SHA="0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+          curl -fL --retry 10 --retry-all-errors -o "$TOKENIZER.part" "$TOKENIZER_URL"
+          echo "$TOKENIZER_SHA  $TOKENIZER.part" | sha256sum -c -
+          mv "$TOKENIZER.part" "$TOKENIZER"
+
+      - name: Build approximately 1K-token memory prompt
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          from tokenizers import Tokenizer
+
+          tok = Tokenizer.from_file("models/qwen-official/tokenizer.json")
+          prefix = (
+              "Important facts to remember until the very end: "
+              "the codeword is ORBIT-928. "
+              "Thirteen boxes contain five marbles each and nine marbles are removed; "
+              "the result is fifty-six.\n"
+          )
+          filler = []
+          i = 0
+          while True:
+              i += 1
+              filler.append(
+                  f"Background note {i}: the weathered archive contains ordinary "
+                  "descriptive material that is unrelated to the important facts. "
+              )
+              body = prefix + "".join(filler)
+              if len(tok.encode(body).ids) >= 960:
+                  break
+          suffix = (
+              "\nNow answer using only the facts from the beginning. "
+              "Output exactly two lines and nothing else. "
+              "Line 1 must start with 'Codeword:' followed by the remembered codeword. "
+              "Line 2 must start with 'Result:' followed by the remembered numeric result and 'marbles'."
+          )
+          prompt = body + suffix
+          Path("work/long-1k/prompt.txt").write_text(prompt, encoding="utf-8")
+          print("RAW_LONG_PROMPT_TOKENS=" + str(len(tok.encode(prompt).ids)))
+          PY
+
+      - name: Run 1K-token tail-32 retention probe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PROMPT="$(cat work/long-1k/prompt.txt)"
+          mkdir -p work/long-1k/k3
+
+          python qwen38/bonsai2_prompt_spike.py \
+            --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+            --native-lib work/long-1k/libbonsai2_quant.so \
+            --state-lib work/long-1k/libgdn_state.so \
+            --tokenizer-json models/qwen-official/tokenizer.json \
+            --prompt "$PROMPT" \
+            --max-new-tokens 32 \
+            --threads 4 \
+            --resident-decoder \
+            --attention-tail-tokens 32 \
+            --no-json-events \
+            --work-dir work/long-1k/k3 \
+            --output work/long-1k/result.json
+
+      - name: Print 1K-token retention summary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          d = json.loads(Path("work/long-1k/result.json").read_text())
+          generated = d["generated_text"]
+          report = {
+              "prompt_token_count": d["prompt_token_count"],
+              "tail_tokens": d["attention_tail_tokens"],
+              "generated_text": generated,
+              "retained_codeword": "ORBIT-928" in generated,
+              "retained_result": "56" in generated,
+              "stop_reason": d["stop_reason"],
+              "prompt_attention_rows_dropped": d["dropped_prompt_attention_rows"],
+              "attention_kv_bytes_end": d["state"]["attention_kv_bytes_f16"],
+              "prefill_seconds": d["timing"]["prefill_total_seconds"],
+              "tokens_per_second": d["timing"]["tokens_per_second"],
+              "max_rss_gib": d["max_rss_gib"],
+          }
+          Path("work/long-1k/summary.json").write_text(
+              json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+          )
+          print("LONG_CONTEXT_RESULT=" + json.dumps(report, ensure_ascii=False))
+          PY
+
+      - name: Drop large files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf models/bonsai2 models/qwen-official
+          rm -f work/long-1k/k3/decoder64.k3.bin
+
+      - name: Upload long-context evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai2-long-1k-tail32
+          path: |
+            work/long-1k/result.json
+            work/long-1k/summary.json
           if-no-files-found: warn
           retention-days: 30
