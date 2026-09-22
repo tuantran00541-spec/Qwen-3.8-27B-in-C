@@ -81,8 +81,8 @@ jobs:
         shell: bash
         run: |
           rm -rf models/bonsai2 models/qwen-official
-          rm -f work/capsule/run/baseline-k3/decoder64.k3.bin
-          rm -f work/capsule/run/restored-k3/decoder64.k3.bin
+          rm -f work/capsule/run/shared-k3/decoder64.k3.bin
+
           rm -f work/capsule/run/chat-state.q38cap
 
       - name: Upload compact evidence

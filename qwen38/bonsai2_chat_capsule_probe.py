@@ -74,7 +74,7 @@ def main() -> None:
 
     capsule_path = args.work_dir / "chat-state.q38cap"
 
-    engine = make_engine(args, args.work_dir / "baseline-k3")
+    engine = make_engine(args, args.work_dir / "shared-k3")
     try:
         for token_id in initial_ids:
             engine.step(int(token_id))
@@ -93,7 +93,7 @@ def main() -> None:
     finally:
         engine.close()
 
-    restored = make_engine(args, args.work_dir / "restored-k3")
+    restored = make_engine(args, args.work_dir / "shared-k3")
     try:
         restored_meta = capsule.load_chat_capsule(restored, capsule_path)
         restored_fp = capsule.engine_fingerprint(restored)
