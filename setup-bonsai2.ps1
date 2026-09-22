@@ -188,7 +188,22 @@ function Install-WingetPackage([string]$Id) {
     return $rc
 }
 
-$python = Resolve-Python -ExplicitExe $PythonExe
+$python = $null
+if (-not [string]::IsNullOrWhiteSpace($PythonExe)) {
+    if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
+        throw "Explicit PythonExe does not exist: $PythonExe"
+    }
+    $resolvedPython = (Resolve-Path -LiteralPath $PythonExe).Path
+    $python = @{
+        Exe = $resolvedPython
+        Prefix = @()
+        ReportedExe = $resolvedPython
+    }
+    Write-Host "Using explicit Python without installer probe: $resolvedPython"
+} else {
+    $python = Resolve-Python
+}
+
 if (-not $python) {
     if ($NoInstallTools) {
         throw 'A 64-bit Python >=3.10 was not found.'
@@ -201,7 +216,7 @@ if (-not $python) {
     $launcherDir = Join-Path $env:LOCALAPPDATA 'Programs\Python\Launcher'
     $env:Path = "$pythonDir;$pythonScripts;$launcherDir;$env:Path"
 
-    $python = Resolve-Python -ExplicitExe $PythonExe
+    $python = Resolve-Python
     if (-not $python) {
         throw 'Python 3.12 is not usable after the winget check. Expected a 64-bit Python >=3.10. Run: python --version'
     }
@@ -228,23 +243,26 @@ Write-Host "Using clang: $clangPath"
 
 $venv = Join-Path $Root '.venv'
 $venvPython = Join-Path $venv 'Scripts\python.exe'
-if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
-    if (-not (Get-PythonInfo -Exe $venvPython)) {
-        Write-Warning 'Existing .venv is not a compatible 64-bit Python >=3.10; recreating it.'
-        Remove-Item -LiteralPath $venv -Recurse -Force
-    }
-}
+
 if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
     $venvArgs = @()
     $venvArgs += @($python.Prefix)
     $venvArgs += @('-m', 'venv', $venv)
+    Write-Host "Creating virtual environment with: $($python.Exe)"
     & $python.Exe @venvArgs
     if ($LASTEXITCODE -ne 0) {
         throw "venv creation failed rc=$LASTEXITCODE"
     }
 }
-if (-not (Get-PythonInfo -Exe $venvPython)) {
-    throw 'The Bonsai runtime virtual environment is not a compatible 64-bit Python >=3.10.'
+
+if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+    throw "Virtual environment Python was not created: $venvPython"
+}
+
+Write-Host "Using venv Python: $venvPython"
+& $venvPython --version
+if ($LASTEXITCODE -ne 0) {
+    throw "venv Python failed to execute rc=$LASTEXITCODE"
 }
 
 & $venvPython -m pip install --upgrade pip
