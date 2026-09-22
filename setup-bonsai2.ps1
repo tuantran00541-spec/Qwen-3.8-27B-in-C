@@ -1,35 +1,104 @@
 param(
-    [switch]$NoInstallTools
+    [switch]$NoInstallTools,
+    [string]$PythonExe = ""
 )
 
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 Set-Location $Root
 
-function Test-Python {
+function Get-PythonInfo {
     param(
         [string]$Exe,
         [string[]]$Prefix = @()
     )
-    if ([string]::IsNullOrWhiteSpace($Exe) -or -not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
-        return $false
+
+    if ([string]::IsNullOrWhiteSpace($Exe)) {
+        return $null
     }
+
     try {
         $probeArgs = @()
         $probeArgs += $Prefix
         $probeArgs += @(
             '-c',
-            'import struct,sys; raise SystemExit(0 if sys.version_info >= (3,10) and struct.calcsize("P") == 8 else 1)'
+            'import struct,sys; print("QWEN38_PYTHON_OK|%d|%d|%d|%s" % (sys.version_info[0], sys.version_info[1], struct.calcsize("P"), sys.executable))'
         )
-        & $Exe @probeArgs *> $null
-        return ($LASTEXITCODE -eq 0)
+        $lines = @(& $Exe @probeArgs 2>&1)
+        $rc = $LASTEXITCODE
+        if ($rc -ne 0) {
+            return $null
+        }
+
+        $marker = $lines | Where-Object {
+            $_.ToString().StartsWith('QWEN38_PYTHON_OK|')
+        } | Select-Object -Last 1
+
+        if (-not $marker) {
+            return $null
+        }
+
+        $parts = $marker.ToString().Split('|', 5)
+        if ($parts.Count -ne 5) {
+            return $null
+        }
+
+        $major = [int]$parts[1]
+        $minor = [int]$parts[2]
+        $pointerBytes = [int]$parts[3]
+        $reportedExe = $parts[4]
+
+        if (($major -lt 3) -or (($major -eq 3) -and ($minor -lt 10))) {
+            return $null
+        }
+        if ($pointerBytes -ne 8) {
+            return $null
+        }
+
+        return @{
+            Exe = $Exe
+            Prefix = @($Prefix)
+            ReportedExe = $reportedExe
+            Version = "$major.$minor"
+            PointerBytes = $pointerBytes
+        }
     } catch {
-        return $false
+        return $null
     }
 }
 
 function Resolve-Python {
+    param(
+        [string]$ExplicitExe = ""
+    )
+
     $candidates = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitExe)) {
+        $candidates += @{
+            Exe = $ExplicitExe
+            Prefix = @()
+            Label = "explicit: $ExplicitExe"
+        }
+    }
+
+    $python = Get-Command python -CommandType Application -ErrorAction SilentlyContinue
+    if ($python) {
+        $candidates += @{
+            Exe = $python.Source
+            Prefix = @()
+            Label = $python.Source
+        }
+    }
+
+    $pythonExeCmd = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($pythonExeCmd) {
+        $candidates += @{
+            Exe = $pythonExeCmd.Source
+            Prefix = @()
+            Label = $pythonExeCmd.Source
+        }
+    }
 
     $py = Get-Command py.exe -CommandType Application -ErrorAction SilentlyContinue
     if ($py) {
@@ -39,15 +108,6 @@ function Resolve-Python {
                 Prefix = @("-$v")
                 Label = "py.exe -$v"
             }
-        }
-    }
-
-    $python = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue
-    if ($python) {
-        $candidates += @{
-            Exe = $python.Source
-            Prefix = @()
-            Label = $python.Source
         }
     }
 
@@ -68,15 +128,27 @@ function Resolve-Python {
         }
     }
 
+    $seen = @{}
     foreach ($candidate in $candidates) {
-        if (Test-Python -Exe $candidate.Exe -Prefix $candidate.Prefix) {
+        $key = "$($candidate.Exe)|$($candidate.Prefix -join ' ')"
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+        $seen[$key] = $true
+
+        $info = Get-PythonInfo -Exe $candidate.Exe -Prefix $candidate.Prefix
+        if ($info) {
             Write-Host "Using Python: $($candidate.Label)"
+            Write-Host "  reported executable: $($info.ReportedExe)"
+            Write-Host "  version: $($info.Version), pointer bytes: $($info.PointerBytes)"
             return @{
                 Exe = $candidate.Exe
                 Prefix = @($candidate.Prefix)
+                ReportedExe = $info.ReportedExe
             }
         }
     }
+
     return $null
 }
 
@@ -116,7 +188,7 @@ function Install-WingetPackage([string]$Id) {
     return $rc
 }
 
-$python = Resolve-Python
+$python = Resolve-Python -ExplicitExe $PythonExe
 if (-not $python) {
     if ($NoInstallTools) {
         throw 'A 64-bit Python >=3.10 was not found.'
@@ -129,7 +201,7 @@ if (-not $python) {
     $launcherDir = Join-Path $env:LOCALAPPDATA 'Programs\Python\Launcher'
     $env:Path = "$pythonDir;$pythonScripts;$launcherDir;$env:Path"
 
-    $python = Resolve-Python
+    $python = Resolve-Python -ExplicitExe $PythonExe
     if (-not $python) {
         throw 'Python 3.12 is not usable after the winget check. Expected a 64-bit Python >=3.10. Run: python --version'
     }
@@ -157,7 +229,7 @@ Write-Host "Using clang: $clangPath"
 $venv = Join-Path $Root '.venv'
 $venvPython = Join-Path $venv 'Scripts\python.exe'
 if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
-    if (-not (Test-Python -Exe $venvPython)) {
+    if (-not (Get-PythonInfo -Exe $venvPython)) {
         Write-Warning 'Existing .venv is not a compatible 64-bit Python >=3.10; recreating it.'
         Remove-Item -LiteralPath $venv -Recurse -Force
     }
@@ -171,7 +243,7 @@ if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
         throw "venv creation failed rc=$LASTEXITCODE"
     }
 }
-if (-not (Test-Python -Exe $venvPython)) {
+if (-not (Get-PythonInfo -Exe $venvPython)) {
     throw 'The Bonsai runtime virtual environment is not a compatible 64-bit Python >=3.10.'
 }
 
