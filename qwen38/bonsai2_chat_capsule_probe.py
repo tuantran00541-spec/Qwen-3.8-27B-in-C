@@ -54,7 +54,12 @@ def main() -> None:
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--tail", type=int, default=31)
-    ap.add_argument("--max-new-tokens", type=int, default=12)
+    ap.add_argument("--max-new-tokens", type=int, default=32)
+    ap.add_argument(
+        "--state-dtype",
+        choices=("f32", "f16", "bf16"),
+        default="f32",
+    )
     args = ap.parse_args()
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
@@ -79,7 +84,10 @@ def main() -> None:
         for token_id in initial_ids:
             engine.step(int(token_id))
         meta = capsule.save_chat_capsule(
-            engine, capsule_path, attention_tail_tokens=args.tail
+            engine,
+            capsule_path,
+            attention_tail_tokens=args.tail,
+            state_dtype=args.state_dtype,
         )
         checkpoint_fp = capsule.engine_fingerprint(engine)
         baseline_hidden = feed_tokens(engine, suffix_ids, tail_tokens=args.tail)
@@ -110,9 +118,12 @@ def main() -> None:
         restored.close()
 
     exact = baseline_ids == restored_ids and baseline_text == restored_text
+    baseline_semantic = "MARBLE-731" in baseline_text and "17" in baseline_text
+    restored_semantic = "MARBLE-731" in restored_text and "17" in restored_text
     result = {
         "schema": "qwen38-bonsai2-chat-capsule-probe-v1",
-        "status": "PASS" if exact else "FAIL",
+        "status": "PASS" if exact else "DIVERGED",
+        "state_dtype": args.state_dtype,
         "tail_tokens": args.tail,
         "initial_prompt_tokens": len(initial_ids),
         "followup_tokens": len(suffix_ids),
@@ -124,6 +135,8 @@ def main() -> None:
         "generated_text_baseline": baseline_text,
         "generated_text_restored": restored_text,
         "exact_resume_parity": exact,
+        "baseline_semantic_recall": baseline_semantic,
+        "restored_semantic_recall": restored_semantic,
         "capsule_file_bytes": meta["capsule_file_bytes"],
         "capsule_payload_bytes": meta["payload_bytes"],
         "capsule_position": meta["position"],
@@ -134,9 +147,14 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
     print(json.dumps(result, indent=2, ensure_ascii=False))
-    if not exact:
+    if args.state_dtype == "f32" and not exact:
         raise SystemExit(1)
-    print("QWEN38_BONSAI2_CHAT_CAPSULE_RESUME_PASS")
+    marker = (
+        "QWEN38_BONSAI2_CHAT_CAPSULE_RESUME_PASS"
+        if exact
+        else "QWEN38_BONSAI2_CHAT_CAPSULE_LOWP_DIVERGED"
+    )
+    print(marker)
 
 
 if __name__ == "__main__":

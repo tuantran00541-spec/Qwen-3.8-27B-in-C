@@ -1,4 +1,4 @@
-name: Bonsai 2 chat history capsule
+name: Bonsai 2 low-precision chat capsule
 
 on:
   push:
@@ -14,9 +14,15 @@ permissions:
   contents: read
 
 jobs:
-  save-load-resume:
+  lowp-resume:
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        state_dtype: [f32, f16, bf16]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+
     steps:
       - uses: actions/checkout@v4
 
@@ -28,16 +34,17 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p work/capsule
+          DTYPE="${{ matrix.state_dtype }}"
+          mkdir -p "work/capsule-$DTYPE"
           gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared \
             qwen38/bonsai2_persistent_pool_portable.c \
             -pthread -lm \
-            -o work/capsule/libbonsai2_quant.so
+            -o "work/capsule-$DTYPE/libbonsai2_quant.so"
           gcc -O3 -std=c11 -fPIC -shared \
             qwen38/gdn_state_ar_portable_pool.c \
             -pthread -lm \
-            -o work/capsule/libgdn_state.so
-          python -m pip install --disable-pip-version-check tokenizers
+            -o "work/capsule-$DTYPE/libgdn_state.so"
+          python -m pip install --disable-pip-version-check tokenizers numpy
           python -m py_compile \
             qwen38/bonsai2_chat_capsule.py \
             qwen38/bonsai2_chat_capsule_probe.py
@@ -65,32 +72,59 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          DTYPE="${{ matrix.state_dtype }}"
           python qwen38/bonsai2_chat_capsule_probe.py \
             --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
-            --native-lib work/capsule/libbonsai2_quant.so \
-            --state-lib work/capsule/libgdn_state.so \
+            --native-lib "work/capsule-$DTYPE/libbonsai2_quant.so" \
+            --state-lib "work/capsule-$DTYPE/libgdn_state.so" \
             --tokenizer-json models/qwen-official/tokenizer.json \
             --threads 4 \
             --tail 31 \
-            --max-new-tokens 12 \
-            --work-dir work/capsule/run \
-            --output work/capsule/result.json
+            --state-dtype "$DTYPE" \
+            --max-new-tokens 32 \
+            --work-dir "work/capsule-$DTYPE/run" \
+            --output "work/capsule-$DTYPE/result.json"
+
+      - name: Print compression result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DTYPE="${{ matrix.state_dtype }}"
+          python - "$DTYPE" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          dtype = sys.argv[1]
+          d = json.loads(Path(f"work/capsule-{dtype}/result.json").read_text())
+          print("LOWP_CAPSULE_RESULT=" + json.dumps({
+              "state_dtype": d["state_dtype"],
+              "exact_resume_parity": d["exact_resume_parity"],
+              "baseline_semantic_recall": d["baseline_semantic_recall"],
+              "restored_semantic_recall": d["restored_semantic_recall"],
+              "capsule_file_bytes": d["capsule_file_bytes"],
+              "capsule_payload_bytes": d["capsule_payload_bytes"],
+              "fingerprint_match": d["fingerprint_match"],
+              "generated_text_baseline": d["generated_text_baseline"],
+              "generated_text_restored": d["generated_text_restored"],
+          }, ensure_ascii=False))
+          PY
 
       - name: Drop large files
         if: always()
         shell: bash
         run: |
+          DTYPE="${{ matrix.state_dtype }}"
           rm -rf models/bonsai2 models/qwen-official
-          rm -f work/capsule/run/shared-k3/decoder64.k3.bin
-
-          rm -f work/capsule/run/chat-state.q38cap
+          rm -f "work/capsule-$DTYPE/run/shared-k3/decoder64.k3.bin"
+          rm -f "work/capsule-$DTYPE/run/chat-state.q38cap"
 
       - name: Upload compact evidence
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: bonsai2-chat-capsule-result
-          path: work/capsule/result.json
+          name: bonsai2-chat-capsule-${{ matrix.state_dtype }}
+          path: work/capsule-${{ matrix.state_dtype }}/result.json
           if-no-files-found: warn
           retention-days: 30
