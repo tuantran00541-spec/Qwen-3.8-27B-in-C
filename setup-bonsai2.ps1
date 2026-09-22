@@ -6,67 +6,173 @@ $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 Set-Location $Root
 
-function Test-Python([string]$Exe, [string[]]$Prefix = @()) {
+function Test-Python {
+    param(
+        [string]$Exe,
+        [string[]]$Prefix = @()
+    )
+    if ([string]::IsNullOrWhiteSpace($Exe) -or -not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+        return $false
+    }
     try {
-        & $Exe @Prefix -c 'import struct,sys; raise SystemExit(0 if sys.version_info >= (3,10) and struct.calcsize("P") == 8 else 1)' *> $null
-        return $LASTEXITCODE -eq 0
+        $probeArgs = @()
+        $probeArgs += $Prefix
+        $probeArgs += @(
+            '-c',
+            'import struct,sys; raise SystemExit(0 if sys.version_info >= (3,10) and struct.calcsize("P") == 8 else 1)'
+        )
+        & $Exe @probeArgs *> $null
+        return ($LASTEXITCODE -eq 0)
     } catch {
         return $false
     }
 }
 
 function Resolve-Python {
-    $py = Get-Command py.exe -ErrorAction SilentlyContinue
+    $candidates = @()
+
+    $py = Get-Command py.exe -CommandType Application -ErrorAction SilentlyContinue
     if ($py) {
         foreach ($v in @('3.12','3.11','3.10')) {
-            if (Test-Python $py.Source @("-$v")) {
-                return @{ Exe = $py.Source; Prefix = @("-$v") }
+            $candidates += @{
+                Exe = $py.Source
+                Prefix = @("-$v")
+                Label = "py.exe -$v"
             }
         }
     }
-    $python = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($python -and (Test-Python $python.Source)) {
-        return @{ Exe = $python.Source; Prefix = @() }
+
+    $python = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($python) {
+        $candidates += @{
+            Exe = $python.Source
+            Prefix = @()
+            Label = $python.Source
+        }
+    }
+
+    foreach ($known in @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python311\python.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python310\python.exe'),
+        'C:\Program Files\Python312\python.exe',
+        'C:\Program Files\Python311\python.exe',
+        'C:\Program Files\Python310\python.exe'
+    )) {
+        if (Test-Path -LiteralPath $known -PathType Leaf) {
+            $candidates += @{
+                Exe = $known
+                Prefix = @()
+                Label = $known
+            }
+        }
+    }
+
+    foreach ($candidate in $candidates) {
+        if (Test-Python -Exe $candidate.Exe -Prefix $candidate.Prefix) {
+            Write-Host "Using Python: $($candidate.Label)"
+            return @{
+                Exe = $candidate.Exe
+                Prefix = @($candidate.Prefix)
+            }
+        }
     }
     return $null
 }
 
-function Install-Winget([string]$Id) {
-    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+function Resolve-Clang {
+    $clang = Get-Command clang.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($clang) {
+        return $clang.Source
+    }
+
+    foreach ($known in @(
+        'C:\Program Files\LLVM\bin\clang.exe',
+        'C:\Program Files (x86)\LLVM\bin\clang.exe'
+    )) {
+        if (Test-Path -LiteralPath $known -PathType Leaf) {
+            $dir = Split-Path -Parent $known
+            if (($env:Path -split ';') -notcontains $dir) {
+                $env:Path = "$dir;$env:Path"
+            }
+            return $known
+        }
+    }
+    return $null
+}
+
+function Install-WingetPackage([string]$Id) {
+    $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue
     if (-not $winget) {
         throw "Missing required tool and winget is unavailable. Install $Id manually."
     }
+
+    Write-Host "Installing/checking $Id with winget..."
     & $winget.Source install -e --id $Id --accept-package-agreements --accept-source-agreements
-    if ($LASTEXITCODE -ne 0) { throw "winget failed for $Id rc=$LASTEXITCODE" }
+    $rc = $LASTEXITCODE
+    if ($rc -ne 0) {
+        Write-Warning "winget returned rc=$rc for $Id. Re-checking whether the tool is already installed before failing."
+    }
+    return $rc
 }
 
 $python = Resolve-Python
 if (-not $python) {
-    if ($NoInstallTools) { throw '64-bit Python >=3.10 is required.' }
-    Install-Winget 'Python.Python.3.12'
-    $env:Path += ";$env:LOCALAPPDATA\Programs\Python\Launcher;$env:LOCALAPPDATA\Programs\Python\Python312"
+    if ($NoInstallTools) {
+        throw 'A 64-bit Python >=3.10 was not found.'
+    }
+
+    Install-WingetPackage 'Python.Python.3.12' | Out-Null
+
+    $pythonDir = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312'
+    $pythonScripts = Join-Path $pythonDir 'Scripts'
+    $launcherDir = Join-Path $env:LOCALAPPDATA 'Programs\Python\Launcher'
+    $env:Path = "$pythonDir;$pythonScripts;$launcherDir;$env:Path"
+
     $python = Resolve-Python
     if (-not $python) {
-        throw 'Python was installed but is not visible yet. Reopen PowerShell and rerun setup-bonsai2.ps1.'
+        throw 'Python 3.12 is not usable after the winget check. Expected a 64-bit Python >=3.10. Run: python --version'
     }
 }
 
-$clang = Get-Command clang.exe -ErrorAction SilentlyContinue
-if (-not $clang) {
-    if ($NoInstallTools) { throw 'LLVM/clang is required.' }
-    Install-Winget 'LLVM.LLVM'
-    $env:Path += ';C:\Program Files\LLVM\bin'
-    $clang = Get-Command clang.exe -ErrorAction SilentlyContinue
-    if (-not $clang) {
-        throw 'LLVM was installed but clang is not visible yet. Reopen PowerShell and rerun setup-bonsai2.ps1.'
+$clangPath = Resolve-Clang
+if (-not $clangPath) {
+    if ($NoInstallTools) {
+        throw 'LLVM/clang was not found.'
+    }
+
+    Install-WingetPackage 'LLVM.LLVM' | Out-Null
+    $llvmDir = 'C:\Program Files\LLVM\bin'
+    if (Test-Path -LiteralPath $llvmDir -PathType Container) {
+        $env:Path = "$llvmDir;$env:Path"
+    }
+
+    $clangPath = Resolve-Clang
+    if (-not $clangPath) {
+        throw 'LLVM/clang is not usable after the winget check. Expected clang.exe under C:\Program Files\LLVM\bin.'
     }
 }
+Write-Host "Using clang: $clangPath"
 
 $venv = Join-Path $Root '.venv'
 $venvPython = Join-Path $venv 'Scripts\python.exe'
+if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
+    if (-not (Test-Python -Exe $venvPython)) {
+        Write-Warning 'Existing .venv is not a compatible 64-bit Python >=3.10; recreating it.'
+        Remove-Item -LiteralPath $venv -Recurse -Force
+    }
+}
 if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-    & $python.Exe @($python.Prefix) -m venv $venv
-    if ($LASTEXITCODE -ne 0) { throw "venv creation failed rc=$LASTEXITCODE" }
+    $venvArgs = @()
+    $venvArgs += @($python.Prefix)
+    $venvArgs += @('-m', 'venv', $venv)
+    & $python.Exe @venvArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "venv creation failed rc=$LASTEXITCODE"
+    }
+}
+if (-not (Test-Python -Exe $venvPython)) {
+    throw 'The Bonsai runtime virtual environment is not a compatible 64-bit Python >=3.10.'
 }
 
 & $venvPython -m pip install --upgrade pip
