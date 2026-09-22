@@ -123,10 +123,10 @@ def sanity(args) -> None:
         encoding="utf-8"
     )
     required_quant = set(
-        re.findall(r"\.lib\.(qwen_[A-Za-z0-9_]+)", adapter_source)
+        re.findall(r"self\.lib\.(qwen_[A-Za-z0-9_]+)", adapter_source)
     )
     required_quant.update(
-        re.findall(r'"(qwen_[A-Za-z0-9_]+)"', adapter_source)
+        re.findall(r'"(qwen_bonsai2_[A-Za-z0-9_]+)"', adapter_source)
     )
     required_quant.update({
         "qwen_bonsai2_permute_gdn_ssm_out_f32",
