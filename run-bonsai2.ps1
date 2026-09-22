@@ -3,6 +3,8 @@ param(
     [string]$Prompt = "",
     [int]$MaxNewTokens = 32,
     [int]$Threads = 4,
+    [ValidateSet('Low','Medium','Full')]
+    [string]$MemoryMode = 'Medium',
     [switch]$LowRam
 )
 
@@ -42,7 +44,10 @@ $argsList = @(
     '--threads', "$Threads",
     '--prompt', $Prompt
 )
-if (-not $LowRam) { $argsList += '--resident-decoder' }
+# Legacy -LowRam stays supported; otherwise default to the balanced Medium profile.
+$effectiveMode = if ($LowRam) { 'Low' } else { $MemoryMode }
+$argsList += @('--memory-mode', $effectiveMode.ToLowerInvariant())
+Write-Host "Bonsai 2 memory mode: $effectiveMode"
 
 & $Python @argsList
 if ($LASTEXITCODE -ne 0) { throw "Bonsai generation failed rc=$LASTEXITCODE" }

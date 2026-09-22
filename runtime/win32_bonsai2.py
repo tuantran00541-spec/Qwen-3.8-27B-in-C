@@ -183,6 +183,48 @@ def sanity(args) -> None:
         )
     print("QWEN38_BONSAI2_WINDOWS_GDN_PERMUTE_PASS")
 
+    # Synthetic 64-layer memory policy check; no GGUF/model download needed.
+    from k3_stream import plan_memory
+
+    fake_layer_mib = 84
+    fake_layer_size = fake_layer_mib * 1024**2
+    fake_layers = [
+        {
+            "layer": i,
+            "read_bytes": fake_layer_size,
+            "data_bytes": fake_layer_size,
+            "file_offset": i * fake_layer_size,
+        }
+        for i in range(64)
+    ]
+    fake_manifest = {
+        "schema": "qwen38-k3-trunk-v1",
+        "alignment": 4096,
+        "layers": fake_layers,
+    }
+    modes = {}
+    for mode in ("low", "medium", "full"):
+        budget, max_pinned = prompt.select_decoder_memory_plan(fake_layers, mode)
+        modes[mode] = plan_memory(
+            fake_manifest,
+            budget,
+            want_ring=2,
+            max_pinned=max_pinned,
+        )
+    if len(modes["low"].pinned_layers) != 0 or modes["low"].ring_slots != 2:
+        raise RuntimeError("low memory mode must use 2-slot streaming only")
+    medium_pins = len(modes["medium"].pinned_layers)
+    if not 0 < medium_pins < 64 or modes["medium"].ring_slots != 2:
+        raise RuntimeError("medium memory mode must pin a partial prefix and preserve 2 rings")
+    if modes["medium"].planned_bytes > prompt.MEDIUM_K3_BUDGET_BYTES:
+        raise RuntimeError("medium memory mode exceeded 2.5 GiB K3 budget")
+    if len(modes["full"].pinned_layers) != 64 or modes["full"].ring_slots != 0:
+        raise RuntimeError("full memory mode must pin all decoder layers")
+    print(
+        f"QWEN38_BONSAI2_WINDOWS_MEMORY_MODES_PASS "
+        f"low_pins=0 medium_pins={medium_pins} full_pins=64"
+    )
+
     state_runtime = prompt.t2.load_state_lib(state, 2)
     try:
         if int(state_runtime.report().get("threads", 0)) != 2:
@@ -205,6 +247,7 @@ def run_once(args) -> None:
         if not path.is_file():
             raise RuntimeError(f"{label} not found: {path}")
 
+    mode = "full" if args.resident_decoder else args.memory_mode
     result = prompt.run(
         model,
         quant,
@@ -221,9 +264,13 @@ def run_once(args) -> None:
         False,
         False,
         None,
+        mode,
     )
     print(json.dumps({
         "status": result["status"],
+        "memory_mode": result["memory_mode"],
+        "reader_planned_gib": round(result["state"]["reader"]["planned_bytes"] / 1024**3, 3),
+        "reader_pinned_layers": len(result["state"]["reader"]["pinned_layers"]),
         "generated_text": result["generated_text"],
         "tokens_per_second": result["timing"]["tokens_per_second"],
         "max_rss_gib": result["max_rss_gib"],
@@ -271,6 +318,7 @@ def chat(args) -> None:
         if not path.is_file():
             raise RuntimeError(f"{label} not found: {path}")
 
+    mode = "full" if args.resident_decoder else args.memory_mode
     engine = prompt.StatefulBonsai2Generator(
         model,
         quant,
@@ -278,9 +326,16 @@ def chat(args) -> None:
         work_dir,
         int(args.threads),
         resident_decoder=bool(args.resident_decoder),
+        memory_mode=mode,
     )
     tokenizer = textgen.load_tokenizer(tokenizer_json)
-    print("Bonsai 2 PTQ1 native Windows ready. Type /exit to quit.")
+    print(
+        f"Bonsai 2 PTQ1 native Windows ready. "
+        f"Memory mode={engine.reader.memory_mode}, "
+        f"pinned layers={len(engine.reader.plan.pinned_layers)}, "
+        f"K3 budget={engine.reader.plan.budget_bytes / 1024**3:.2f} GiB. "
+        f"Type /exit to quit."
+    )
     print("This shell resets model state between prompts; chat-history capsules remain experimental.")
     try:
         while True:
@@ -325,7 +380,17 @@ def parser() -> argparse.ArgumentParser:
         p.add_argument("--work-dir", type=Path, default=Path("work/bonsai2-k3"))
         p.add_argument("--threads", type=int, default=4)
         p.add_argument("--max-new-tokens", type=int, default=32)
-        p.add_argument("--resident-decoder", action="store_true")
+        p.add_argument(
+            "--memory-mode",
+            choices=("low", "medium", "full"),
+            default="medium",
+            help="low=2 SSD ring slots, medium=2.5 GiB pinned+ring, full=all decoder",
+        )
+        p.add_argument(
+            "--resident-decoder",
+            action="store_true",
+            help="legacy alias for --memory-mode full",
+        )
 
     r = sub.add_parser("run")
     common(r)

@@ -18,22 +18,43 @@ On Windows PowerShell:
 ```powershell
 git switch main
 git pull --ff-only origin main
-powershell -ExecutionPolicy Bypass -File .\setup-bonsai2.ps1
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup-bonsai2.ps1
 .\run-bonsai2.ps1 "Hello" -MaxNewTokens 8
 ```
 
-For lower RAM usage, stream decoder layers from SSD instead of keeping the decoder resident:
+**Default memory mode: Medium** (balanced for a 16-GiB Windows laptop). It allocates a
+**2.5-GiB K3 layer-cache budget** that pins an early decoder-layer prefix in RAM
+while streaming the remaining layers through two SSD ring slots. In addition to
+that budget, allow room for recurrent state, Python, Windows and filesystem cache.
 
 ```powershell
+# Balanced default, equivalent to -MemoryMode Medium:
+.\run-bonsai2.ps1 "Hello" -MaxNewTokens 8 -MemoryMode Medium
+
+# Minimal RAM (~170 MiB streaming rings plus state/runtime overhead):
+.\run-bonsai2.ps1 "Hello" -MaxNewTokens 8 -MemoryMode Low
+
+# Backward-compatible alias for -MemoryMode Low:
 .\run-bonsai2.ps1 "Hello" -MaxNewTokens 8 -LowRam
+
+# Pin the complete ~5.38-GB decoder:
+.\run-bonsai2.ps1 "Hello" -MaxNewTokens 8 -MemoryMode Full
 ```
 
-The first Bonsai run builds an execution-ordered K3 trunk once under `work\bonsai2-k3`; later runs reuse it.
+Medium is a RAM/I/O trade-off, not a guaranteed speedup; compare the reported
+`tokens_per_second`, `reader.pinned_layers`, `reader.bytes_read` and
+`max_rss_gib` on the same prompt. Memory modes do not change quantization,
+model weights or attention-history behavior.
+
+The first Bonsai run builds an execution-ordered K3 trunk once under
+`work\bonsai2-k3`; later runs reuse it. Changing memory modes **does not**
+repack K3 or redownload the GGUF.
 
 An interactive shell is also available:
 
 ```powershell
-.\chat-bonsai2.ps1 -MaxNewTokens 32
+.\chat-bonsai2.ps1 -MaxNewTokens 32 -MemoryMode Medium
 ```
 
 The chat-history capsule work is now in-tree. The validated low-precision capsule stores GDN recurrent state as **BF16**, keeps convolution history in F32 and the bounded attention tail in F16. The BF16 capsule measured about **83.4 MB** in the release probe and resumed token-for-token identically to the F32 control for that probe. It remains an experimental history acceleration layer; the durable text transcript should still be kept separately.

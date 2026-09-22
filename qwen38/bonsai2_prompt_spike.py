@@ -35,6 +35,32 @@ N_LAYER = 64
 EOS_IDS = {248044, 248046}
 
 
+# A 2.5-GiB K3 working set for the balanced 16-GiB laptop profile.
+# This includes pinned decoder layers AND both streaming ring slots.
+MEDIUM_K3_BUDGET_BYTES = 2560 * 1024**2
+
+
+def select_decoder_memory_plan(
+    layers: list[dict[str, Any]],
+    memory_mode: str,
+) -> tuple[int, int]:
+    """Return (K3 byte budget, max pinned layers), preserving a 2-slot stream."""
+    if not layers:
+        raise ValueError("decoder manifest has no layers")
+    mode = str(memory_mode).lower()
+    sizes = [int(layer["read_bytes"]) for layer in layers]
+    if any(size <= 0 for size in sizes):
+        raise ValueError("decoder layer read_bytes must be positive")
+    total = sum(sizes)
+    if mode == "full":
+        return total, len(layers)
+    if mode == "low":
+        return 2 * max(sizes), 0
+    if mode == "medium":
+        return max(2 * max(sizes), min(total, MEDIUM_K3_BUDGET_BYTES)), len(layers)
+    raise ValueError(f"unsupported Bonsai memory_mode={memory_mode!r}")
+
+
 class Bonsai2DecoderReader(K3Trunk):
     def __init__(
         self,
@@ -44,19 +70,18 @@ class Bonsai2DecoderReader(K3Trunk):
         *,
         resident_decoder: bool,
         prefer_direct_io: bool = True,
+        memory_mode: str | None = None,
     ) -> None:
         layers = list(manifest["layers"])
-        if not layers:
-            raise ValueError("decoder manifest has no layers")
-        self.resident_decoder = bool(resident_decoder)
+        mode = (
+            str(memory_mode).lower()
+            if memory_mode is not None
+            else ("full" if resident_decoder else "low")
+        )
+        budget_bytes, max_pinned = select_decoder_memory_plan(layers, mode)
+        self.memory_mode = mode
+        self.resident_decoder = mode == "full"
         self.decoder_resident_bytes = sum(int(x["read_bytes"]) for x in layers)
-        max_layer_bytes = max(int(x["read_bytes"]) for x in layers)
-        if self.resident_decoder:
-            budget_bytes = self.decoder_resident_bytes
-            max_pinned = len(layers)
-        else:
-            budget_bytes = 2 * max_layer_bytes
-            max_pinned = 0
         super().__init__(
             bin_path,
             index_path,
@@ -68,6 +93,7 @@ class Bonsai2DecoderReader(K3Trunk):
 
     def report(self) -> dict[str, Any]:
         out = super().report()
+        out["memory_mode"] = self.memory_mode
         out["resident_decoder"] = self.resident_decoder
         out["decoder_resident_bytes"] = self.decoder_resident_bytes
         return out
@@ -80,6 +106,7 @@ def make_decoder_reader(
     *,
     resident_decoder: bool,
     prefer_direct_io: bool = True,
+    memory_mode: str | None = None,
 ) -> Bonsai2DecoderReader:
     return Bonsai2DecoderReader(
         bin_path,
@@ -87,6 +114,7 @@ def make_decoder_reader(
         manifest,
         resident_decoder=resident_decoder,
         prefer_direct_io=prefer_direct_io,
+        memory_mode=memory_mode,
     )
 
 
@@ -320,6 +348,7 @@ class StatefulBonsai2Generator:
         work_dir: Path,
         threads: int,
         resident_decoder: bool = False,
+        memory_mode: str | None = None,
     ) -> None:
         exact.install()
         self.model = model
@@ -378,6 +407,7 @@ class StatefulBonsai2Generator:
             self.manifest,
             resident_decoder=resident_decoder,
             prefer_direct_io=True,
+            memory_mode=memory_mode,
         )
         self.output_norm = base.read_f32_global(
             model, self.tensors["output_norm.weight"]
@@ -545,6 +575,7 @@ def run(
     json_events: bool = True,
     state_only_decode: bool = False,
     attention_tail_tokens: int | None = None,
+    memory_mode: str | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     tokenizer = textgen.load_tokenizer(tokenizer_json)
@@ -570,6 +601,7 @@ def run(
         work_dir,
         threads,
         resident_decoder=resident_decoder,
+        memory_mode=memory_mode,
     )
     generated: list[int] = []
     token_reports: list[dict[str, Any]] = []
@@ -710,7 +742,8 @@ def run(
             "stop_reason": stop_reason,
             "completion_truncated": stop_reason == "max_new_tokens",
             "threads": threads,
-            "resident_decoder": resident_decoder,
+            "resident_decoder": engine.reader.resident_decoder,
+            "memory_mode": engine.reader.memory_mode,
             "state_only_decode": state_only_decode,
             "attention_tail_tokens": effective_attention_tail,
             "dropped_prompt_attention_rows": dropped_prompt_attention_rows,
@@ -771,6 +804,12 @@ def main() -> None:
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--resident-decoder", action="store_true")
+    ap.add_argument(
+        "--memory-mode",
+        choices=("low", "medium", "full"),
+        default=None,
+        help="low=SSD rings, medium=2.5-GiB K3 working set, full=all layers pinned",
+    )
     ap.add_argument("--expected-text")
     ap.add_argument("--stream-text", action="store_true")
     ap.add_argument("--no-json-events", action="store_true")
@@ -803,6 +842,7 @@ def main() -> None:
         not args.no_json_events,
         args.state_only_decode,
         args.attention_tail_tokens,
+        args.memory_mode,
     )
 
 
