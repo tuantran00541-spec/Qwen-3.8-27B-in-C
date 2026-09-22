@@ -1,4 +1,6 @@
 param(
+    [ValidateSet("Q6", "Bonsai2")]
+    [string]$Runtime = "Q6",
     [string]$ModelDir = ""
 )
 
@@ -31,11 +33,20 @@ function Move-BadDownload([string]$Path, [string]$Label) {
     return $bad
 }
 
-$ModelName = 'Qwen3.8-27B-Q6_K_L.gguf'
-$ModelPath = Join-Path $ModelDir $ModelName
+if ($Runtime -eq 'Bonsai2') {
+    $BonsaiDir = Join-Path $ModelDir 'bonsai2'
+    New-Item -ItemType Directory -Force -Path $BonsaiDir | Out-Null
+    $ModelName = 'Ternary-Bonsai-2-27B-PTQ1_0.gguf'
+    $ModelPath = Join-Path $BonsaiDir $ModelName
+    $ExpectedSha = '53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3'
+    $ModelUrl = 'https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/6ed5e12bf84b7a63069882c91dd9e9218647d17b/Ternary-Bonsai-2-27B-PTQ1_0.gguf?download=true'
+} else {
+    $ModelName = 'Qwen3.8-27B-Q6_K_L.gguf'
+    $ModelPath = Join-Path $ModelDir $ModelName
+    $ExpectedSha = 'a487690b9f17de581857c4ae484dab50800335bb9eb978a4fb02c0465629dc0a'
+    $ModelUrl = 'https://huggingface.co/bartowski/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q6_K_L.gguf?download=true'
+}
 $ModelPart = "$ModelPath.part"
-$ExpectedSha = 'a487690b9f17de581857c4ae484dab50800335bb9eb978a4fb02c0465629dc0a'
-$ModelUrl = 'https://huggingface.co/bartowski/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q6_K_L.gguf?download=true'
 
 if (Test-Path -LiteralPath $ModelPath -PathType Leaf) {
     Write-Host 'Existing GGUF found; verifying SHA256...'
@@ -121,6 +132,7 @@ if (-not (Test-Path -LiteralPath $TokenizerPath -PathType Leaf)) {
     Move-Item -LiteralPath $TokenizerPart -Destination $TokenizerPath -Force
 }
 
+Write-Host "Runtime: $Runtime"
 Write-Host "GGUF: $ModelPath"
 Write-Host "Tokenizer: $TokenizerPath"
 Write-Host 'QWEN38_NATIVE_WINDOWS_DOWNLOAD_PASS'

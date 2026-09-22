@@ -74,6 +74,25 @@ Build-Dll 'qwen_q6_portable.dll' @((Join-Path $Src 'q6_persistent_pool_portable_
     'qwen_q6_pool_create','qwen_q6_pool_destroy','qwen_q6_pool_matvec_many',
     'qwen_q6_pool_calls','qwen_q6_pool_threads',
     'qwen_matvec_many_q6_k_q8_k_bridge','qwen_matvec_many_q8_0_q8_0_bridge') @('-mavx2')
+
+Build-Dll 'qwen_bonsai2_quant.dll' @(
+    (Join-Path $Src 'bonsai2_persistent_pool_portable.c'),$compatObj) @(
+    'qwen_bonsai2_pool_create','qwen_bonsai2_pool_destroy',
+    'qwen_bonsai2_pool_matvec_ptq1_0','qwen_bonsai2_pool_matvec_pq2_0',
+    'qwen_bonsai2_pool_ffn_ptq1_0','qwen_bonsai2_pool_recurrent_projections_ptq1_bf16',
+    'qwen_bonsai2_pool_calls','qwen_bonsai2_pool_threads',
+    'qwen_bonsai2_attention_core_f32','qwen_bonsai2_attention_gate_f32',
+    'qwen_bonsai2_recurrent_mid_f32','qwen_bonsai2_residual_add_f32',
+    'qwen_bonsai2_rms_norm_f32','qwen_bonsai2_swiglu_f32',
+    'qwen_bonsai2_gdn_conv_silu_f32','qwen_bonsai2_gdn_repeat_scale_f32',
+    'qwen_bonsai2_gdn_norm_gate_f32','qwen_bonsai2_fwht_blocks',
+    'qwen_bonsai2_inverse_fwht_blocks','qwen_bonsai2_matvec_ptq1_0_q8_0',
+    'qwen_bonsai2_matvec_pq2_0_q8_0','qwen_bonsai2_matvec_bf16_f32',
+    'qwen_quantize_q8_0_scalar') (@('-mavx2','-mfma') + $expfRedirect)
+Build-Dll 'qwen_bonsai2_gdn_state.dll' @(
+    (Join-Path $Src 'gdn_state_ar_portable_pool.c'),$compatObj) @(
+    'qwen_gdn_pool_create','qwen_gdn_pool_destroy','qwen_gdn_pool_step_f32',
+    'qwen_gdn_pool_threads','qwen_gdn_pool_calls') (@('-mavx2') + $expfRedirect)
 Build-Dll 'qwen_gdn_state.dll' @((Join-Path $Src 'gdn_state_ar.c'),$compatObj) @('qwen_gdn_ar_step_f32') $expfRedirect
 Build-Dll 'qwen_gdn_state_batch.dll' @((Join-Path $Src 'gdn_state_ar.c'),(Join-Path $Src 'gdn_state_batch_exact.c'),$compatObj) @('qwen_gdn_ar_batch_f32') $expfRedirect
 Build-Dll 'qwen_f32.dll' @((Join-Path $Src 'f32_fsum_matvec.c')) @('qwen_matvec_f32_fsum_exact')

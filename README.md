@@ -1,5 +1,48 @@
 # Qwen3.8-27B low-RAM CPU runtime
 
+## Recommended Windows path: Ternary Bonsai 2 PTQ1
+
+The current recommended local model is now **Ternary Bonsai 2 27B PTQ1_0**, not the older ~24 GB Q6_K_L package.
+
+Pinned model:
+
+- repository: `prism-ml/Ternary-Bonsai-2-27B-gguf`
+- revision: `6ed5e12bf84b7a63069882c91dd9e9218647d17b`
+- file: `Ternary-Bonsai-2-27B-PTQ1_0.gguf`
+- size: `5,946,648,928` bytes (~5.95 GB)
+- SHA256: `53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3`
+- tokenizer: pinned `Qwen/Qwen3.8-27B` tokenizer at revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`
+
+On Windows PowerShell:
+
+```powershell
+git switch main
+git pull --ff-only origin main
+powershell -ExecutionPolicy Bypass -File .\setup-bonsai2.ps1
+.\run-bonsai2.ps1 "Hello" -MaxNewTokens 8
+```
+
+For lower RAM usage, stream decoder layers from SSD instead of keeping the decoder resident:
+
+```powershell
+.\run-bonsai2.ps1 "Hello" -MaxNewTokens 8 -LowRam
+```
+
+The first Bonsai run builds an execution-ordered K3 trunk once under `work\bonsai2-k3`; later runs reuse it.
+
+An interactive shell is also available:
+
+```powershell
+.\chat-bonsai2.ps1 -MaxNewTokens 32
+```
+
+The chat-history capsule work is now in-tree. The validated low-precision capsule stores GDN recurrent state as **BF16**, keeps convolution history in F32 and the bounded attention tail in F16. The BF16 capsule measured about **83.4 MB** in the release probe and resumed token-for-token identically to the F32 control for that probe. It remains an experimental history acceleration layer; the durable text transcript should still be kept separately.
+
+### Legacy Q6 package
+
+The older `Qwen3.8-27B-Q6_K_L.gguf` Windows package and `setup.ps1/run.ps1/chat.ps1` are retained for regression/reference use. They are no longer the recommended first download.
+
+
 Experimental CPU-only runtime for **Qwen/Qwen3.8-27B** that keeps the model primarily on SSD/NVMe instead of loading the full GGUF into RAM.
 
 ## Native Windows is now the default user path

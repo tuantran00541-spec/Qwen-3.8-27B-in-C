@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Native-Windows launcher for the Bonsai 2 PTQ1 Qwen3.8 runtime."""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import os
+from pathlib import Path
+import sys
+import threading
+
+ROOT = Path(__file__).resolve().parents[1]
+QWEN38 = ROOT / "qwen38"
+if str(QWEN38) not in sys.path:
+    sys.path.insert(0, str(QWEN38))
+
+MODEL_NAME = "Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+MODEL_SHA256 = "53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"
+N_LAYER = 64
+_PREAD_LOCK = threading.Lock()
+
+
+def _require_windows() -> None:
+    if sys.platform != "win32":
+        raise SystemExit("This launcher requires native Windows Python.")
+
+
+def _resolve(path: Path) -> Path:
+    return path if path.is_absolute() else (ROOT / path).resolve()
+
+
+def _install_pread_compat() -> None:
+    if hasattr(os, "pread"):
+        return
+    _require_windows()
+    import msvcrt
+
+    def pread(fd: int, nbytes: int, offset: int) -> bytes:
+        if nbytes < 0 or offset < 0:
+            raise ValueError("pread nbytes/offset must be non-negative")
+        with _PREAD_LOCK:
+            msvcrt.setmode(fd, os.O_BINARY)
+            restore = os.lseek(fd, 0, os.SEEK_CUR)
+            try:
+                os.lseek(fd, int(offset), os.SEEK_SET)
+                parts: list[bytes] = []
+                done = 0
+                while done < int(nbytes):
+                    chunk = os.read(fd, int(nbytes) - done)
+                    if not chunk:
+                        break
+                    parts.append(chunk)
+                    done += len(chunk)
+                return b"".join(parts)
+            finally:
+                os.lseek(fd, restore, os.SEEK_SET)
+
+    setattr(os, "pread", pread)
+
+
+def _load_runtime(build_dir: Path):
+    _require_windows()
+    build_dir = _resolve(build_dir)
+
+    compat = build_dir / "qwen_glibc_expf_compat.dll"
+    quant = build_dir / "qwen_bonsai2_quant.dll"
+    state = build_dir / "qwen_bonsai2_gdn_state.dll"
+    for path in (compat, quant, state):
+        if not path.is_file():
+            raise RuntimeError(f"missing Bonsai runtime DLL: {path}")
+
+    os.environ["QWEN38_EXPF_COMPAT_LIB"] = str(compat)
+
+    from qwen38_win32_bootstrap import (
+        _bind_win32_expf,
+        install_resource_compat,
+    )
+
+    install_resource_compat()
+    _install_pread_compat()
+
+    import bonsai2_prompt_spike as prompt
+    import qwen35_k3_generate as textgen
+
+    _bind_win32_expf(prompt.exact)
+
+    original_pack = prompt.pack_gguf_layers
+
+    def cached_pack(directory, out_bin: Path, out_index: Path, **kwargs):
+        out_bin = Path(out_bin)
+        out_index = Path(out_index)
+        if out_bin.is_file() and out_index.is_file():
+            try:
+                manifest = json.loads(out_index.read_text(encoding="utf-8"))
+                reusable = (
+                    manifest.get("source", {}).get("sha256") == MODEL_SHA256
+                    and len(manifest.get("layers", [])) == N_LAYER
+                    and int(manifest.get("packed_file_bytes", -1)) == out_bin.stat().st_size
+                )
+            except Exception:
+                reusable = False
+            if reusable:
+                print(f"Reusing Bonsai K3 trunk: {out_bin}", file=sys.stderr)
+                return manifest
+        print(f"Packing Bonsai K3 trunk once: {out_bin}", file=sys.stderr)
+        return original_pack(directory, out_bin, out_index, **kwargs)
+
+    prompt.pack_gguf_layers = cached_pack
+    return prompt, textgen, quant, state
+
+
+def sanity(args) -> None:
+    prompt, _textgen, quant, state = _load_runtime(args.build_dir)
+
+    qlib = ctypes.CDLL(str(quant))
+    required_quant = (
+        "qwen_bonsai2_pool_create",
+        "qwen_bonsai2_pool_destroy",
+        "qwen_bonsai2_pool_matvec_ptq1_0",
+        "qwen_bonsai2_pool_ffn_ptq1_0",
+        "qwen_bonsai2_attention_core_f32",
+        "qwen_bonsai2_recurrent_mid_f32",
+    )
+    for name in required_quant:
+        getattr(qlib, name)
+
+    state_runtime = prompt.t2.load_state_lib(state, 2)
+    try:
+        if int(state_runtime.report().get("threads", 0)) != 2:
+            raise RuntimeError("Bonsai GDN state pool did not start with 2 threads")
+    finally:
+        state_runtime.close()
+
+    if not hasattr(os, "pread"):
+        raise RuntimeError("Win32 positional-read compatibility was not installed")
+    print("QWEN38_BONSAI2_NATIVE_WINDOWS_SANITY_PASS")
+
+
+def run_once(args) -> None:
+    prompt, _textgen, quant, state = _load_runtime(args.build_dir)
+    model = _resolve(args.model)
+    tokenizer = _resolve(args.tokenizer_json)
+    work_dir = _resolve(args.work_dir)
+    output = _resolve(args.output)
+    for label, path in (("model", model), ("tokenizer", tokenizer)):
+        if not path.is_file():
+            raise RuntimeError(f"{label} not found: {path}")
+
+    result = prompt.run(
+        model,
+        quant,
+        state,
+        tokenizer,
+        args.prompt,
+        int(args.max_new_tokens),
+        work_dir,
+        output,
+        int(args.threads),
+        bool(args.resident_decoder),
+        None,
+        True,
+        False,
+        False,
+        None,
+    )
+    print(json.dumps({
+        "status": result["status"],
+        "generated_text": result["generated_text"],
+        "tokens_per_second": result["timing"]["tokens_per_second"],
+        "max_rss_gib": result["max_rss_gib"],
+    }, indent=2, ensure_ascii=False))
+    print("QWEN38_BONSAI2_NATIVE_WINDOWS_GENERATION_PASS")
+
+
+def _reset_engine(engine) -> None:
+    for state in engine.states.values():
+        ctypes.memset(ctypes.addressof(state), 0, ctypes.sizeof(state))
+    for hist in engine.conv_history.values():
+        hist.clear()
+    for cache in engine.caches.values():
+        cache["k"].clear()
+        cache["v"].clear()
+    engine.runtime._attention_cache.clear()
+    engine.position = 0
+
+
+def _generate(engine, prompt, tokenizer, text: str, max_new_tokens: int) -> str:
+    _rendered, prompt_ids = prompt.textgen.encode_prompt(tokenizer, text, raw=False)
+    hidden = None
+    for token_id in prompt_ids:
+        hidden = engine.step(int(token_id))
+    if hidden is None:
+        return ""
+
+    generated: list[int] = []
+    for index in range(max_new_tokens):
+        logits = engine.logits(hidden)
+        token_id = int(prompt.base.topk(logits, 1)[0]["token"])
+        generated.append(token_id)
+        if token_id in prompt.EOS_IDS or index + 1 >= max_new_tokens:
+            break
+        hidden = engine.step(token_id)
+    return tokenizer.decode(generated, skip_special_tokens=False)
+
+
+def chat(args) -> None:
+    prompt, textgen, quant, state = _load_runtime(args.build_dir)
+    model = _resolve(args.model)
+    tokenizer_json = _resolve(args.tokenizer_json)
+    work_dir = _resolve(args.work_dir)
+    for label, path in (("model", model), ("tokenizer", tokenizer_json)):
+        if not path.is_file():
+            raise RuntimeError(f"{label} not found: {path}")
+
+    engine = prompt.StatefulBonsai2Generator(
+        model,
+        quant,
+        state,
+        work_dir,
+        int(args.threads),
+        resident_decoder=bool(args.resident_decoder),
+    )
+    tokenizer = textgen.load_tokenizer(tokenizer_json)
+    print("Bonsai 2 PTQ1 native Windows ready. Type /exit to quit.")
+    print("This shell resets model state between prompts; chat-history capsules remain experimental.")
+    try:
+        while True:
+            try:
+                user = input("You > ").strip()
+            except EOFError:
+                break
+            if not user:
+                continue
+            if user.lower() in {"/exit", "/quit", "exit", "quit"}:
+                break
+            _reset_engine(engine)
+            try:
+                answer = _generate(engine, prompt, tokenizer, user, int(args.max_new_tokens))
+                print(f"Qwen > {answer}")
+            except KeyboardInterrupt:
+                print("\nGeneration interrupted.")
+                _reset_engine(engine)
+    finally:
+        engine.close()
+
+
+def parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Native Windows Bonsai 2 PTQ1 launcher")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("sanity")
+    s.add_argument("--build-dir", type=Path, default=Path("build/win32"))
+
+    def common(p):
+        p.add_argument("--build-dir", type=Path, default=Path("build/win32"))
+        p.add_argument(
+            "--model",
+            type=Path,
+            default=Path("models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"),
+        )
+        p.add_argument(
+            "--tokenizer-json",
+            type=Path,
+            default=Path("models/qwen-official/tokenizer.json"),
+        )
+        p.add_argument("--work-dir", type=Path, default=Path("work/bonsai2-k3"))
+        p.add_argument("--threads", type=int, default=4)
+        p.add_argument("--max-new-tokens", type=int, default=32)
+        p.add_argument("--resident-decoder", action="store_true")
+
+    r = sub.add_parser("run")
+    common(r)
+    r.add_argument("--prompt", required=True)
+    r.add_argument("--output", type=Path, default=Path("work/bonsai2-generation.json"))
+
+    c = sub.add_parser("chat")
+    common(c)
+    return ap
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.cmd == "sanity":
+        sanity(args)
+    elif args.cmd == "run":
+        run_once(args)
+    else:
+        chat(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

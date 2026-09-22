@@ -1,0 +1,83 @@
+name: Bonsai 2 Windows user path
+
+on:
+  push:
+    branches:
+      - experiment/bonsai2-gdn-state-only
+      - main
+    paths:
+      - runtime/win32_bonsai2.py
+      - setup-bonsai2.ps1
+      - run-bonsai2.ps1
+      - chat-bonsai2.ps1
+      - scripts/build_win32.ps1
+      - scripts/download_model.ps1
+      - qwen38/bonsai2_persistent_pool_portable.c
+      - qwen38/bonsai2_quant_dot_avx2.c
+      - qwen38/gdn_state_ar_portable_pool.c
+      - qwen38/qwen_thread_compat.h
+      - qwen38/bonsai2_quant_runtime.py
+      - qwen38/bonsai2_prompt_spike.py
+      - qwen38/qwen38_win32_bootstrap.py
+      - .github/workflows/bonsai2-windows-user-path.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-sanity:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Parse PowerShell launchers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(
+            'setup-bonsai2.ps1',
+            'run-bonsai2.ps1',
+            'chat-bonsai2.ps1',
+            'scripts\build_win32.ps1',
+            'scripts\download_model.ps1'
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$file : $($_.Message)" }
+              throw "PowerShell parse failed for $file"
+            }
+          }
+          Write-Host 'QWEN38_BONSAI2_WINDOWS_POWERSHELL_PARSE_PASS'
+
+      - name: Compile Python launcher
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check tokenizers numpy
+          python -m py_compile runtime\win32_bonsai2.py qwen38\bonsai2_chat_capsule.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build native Windows DLL bundle
+        shell: pwsh
+        run: |
+          $env:Path += ';C:\Program Files\LLVM\bin'
+          .\scripts\build_win32.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run Bonsai native Windows sanity
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "$PWD\qwen38"
+          $env:QWEN38_EXPF_COMPAT_LIB = "$PWD\build\win32\qwen_glibc_expf_compat.dll"
+          python -u runtime\win32_bonsai2.py sanity --build-dir build\win32
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
