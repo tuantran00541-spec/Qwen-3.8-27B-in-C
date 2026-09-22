@@ -113,17 +113,75 @@ def _load_runtime(build_dir: Path):
 def sanity(args) -> None:
     prompt, _textgen, quant, state = _load_runtime(args.build_dir)
 
+    # Validate the full Python <-> native ABI before a user downloads
+    # gigabytes of model weights. The earlier partial check missed
+    # qwen_bonsai2_permute_gdn_ssm_out_f32 and both row-dequantizers.
+    import re
+
     qlib = ctypes.CDLL(str(quant))
-    required_quant = (
-        "qwen_bonsai2_pool_create",
-        "qwen_bonsai2_pool_destroy",
-        "qwen_bonsai2_pool_matvec_ptq1_0",
-        "qwen_bonsai2_pool_ffn_ptq1_0",
-        "qwen_bonsai2_attention_core_f32",
-        "qwen_bonsai2_recurrent_mid_f32",
+    adapter_source = (QWEN38 / "bonsai2_quant_runtime.py").read_text(
+        encoding="utf-8"
     )
-    for name in required_quant:
+    required_quant = set(
+        re.findall(r"\.lib\.(qwen_[A-Za-z0-9_]+)", adapter_source)
+    )
+    required_quant.update(
+        re.findall(r'"(qwen_[A-Za-z0-9_]+)"', adapter_source)
+    )
+    required_quant.update({
+        "qwen_bonsai2_permute_gdn_ssm_out_f32",
+        "qwen_bonsai2_dequantize_ptq1_0_row",
+        "qwen_bonsai2_dequantize_pq2_0_row",
+    })
+    for name in sorted(required_quant):
         getattr(qlib, name)
+    print(
+        f"QWEN38_BONSAI2_WINDOWS_ABI_EXPORTS_PASS "
+        f"symbols={len(required_quant)}"
+    )
+
+    # Construct the same ctypes adapter that the real first token uses,
+    # but with a tiny synthetic config; no GGUF download is needed.
+    adapter = prompt.Bonsai2NativeRuntime(
+        quant,
+        {
+            "prism.hadamard.version": 1,
+            "prism.hadamard.block_size": 128,
+            "prism.hadamard.transform": "normalized-sylvester-walsh-hadamard",
+            "prism.hadamard.axis": "input-last-dimension",
+            "prism.hadamard.sign_mode": "identity",
+        },
+        threads=2,
+        max_rows=1024,
+    )
+    try:
+        if adapter.pool is None:
+            raise RuntimeError("Bonsai native quant pool was not created")
+    finally:
+        adapter.close()
+    print("QWEN38_BONSAI2_WINDOWS_ADAPTER_INIT_PASS")
+
+    # Prove that the previously missing permute function can actually run.
+    src = (ctypes.c_float * 12)(*range(12))
+    dst = (ctypes.c_float * 12)()
+    permute = qlib.qwen_bonsai2_permute_gdn_ssm_out_f32
+    permute.argtypes = [
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    ]
+    permute.restype = ctypes.c_int
+    rc = permute(src, dst, 12, 2, 2, 3)
+    expected = [0, 1, 4, 5, 8, 9, 2, 3, 6, 7, 10, 11]
+    if rc != 0 or list(dst) != expected:
+        raise RuntimeError(
+            f"Bonsai native GDN permutation mismatch rc={rc} "
+            f"actual={list(dst)} expected={expected}"
+        )
+    print("QWEN38_BONSAI2_WINDOWS_GDN_PERMUTE_PASS")
 
     state_runtime = prompt.t2.load_state_lib(state, 2)
     try:

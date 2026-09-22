@@ -86,6 +86,9 @@ Build-Dll 'qwen_bonsai2_quant.dll' @(
     'qwen_bonsai2_rms_norm_f32','qwen_bonsai2_swiglu_f32',
     'qwen_bonsai2_gdn_conv_silu_f32','qwen_bonsai2_gdn_repeat_scale_f32',
     'qwen_bonsai2_gdn_norm_gate_f32','qwen_bonsai2_fwht_blocks',
+    'qwen_bonsai2_permute_gdn_ssm_out_f32',
+    'qwen_bonsai2_dequantize_ptq1_0_row',
+    'qwen_bonsai2_dequantize_pq2_0_row',
     'qwen_bonsai2_inverse_fwht_blocks','qwen_bonsai2_matvec_ptq1_0_q8_0',
     'qwen_bonsai2_matvec_pq2_0_q8_0','qwen_bonsai2_matvec_bf16_f32',
     'qwen_quantize_q8_0_scalar') (@('-mavx2','-mfma') + $expfRedirect)
