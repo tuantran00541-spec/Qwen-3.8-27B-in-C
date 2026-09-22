@@ -1,0 +1,96 @@
+name: Bonsai 2 chat history capsule
+
+on:
+  push:
+    branches:
+      - experiment/bonsai2-gdn-state-only
+    paths:
+      - qwen38/bonsai2_chat_capsule.py
+      - qwen38/bonsai2_chat_capsule_probe.py
+      - .github/workflows/bonsai2-chat-capsule.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  save-load-resume:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build native runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work/capsule
+          gcc -O3 -std=c11 -mavx2 -mfma -fPIC -shared \
+            qwen38/bonsai2_persistent_pool_portable.c \
+            -pthread -lm \
+            -o work/capsule/libbonsai2_quant.so
+          gcc -O3 -std=c11 -fPIC -shared \
+            qwen38/gdn_state_ar_portable_pool.c \
+            -pthread -lm \
+            -o work/capsule/libgdn_state.so
+          python -m pip install --disable-pip-version-check tokenizers
+          python -m py_compile \
+            qwen38/bonsai2_chat_capsule.py \
+            qwen38/bonsai2_chat_capsule_probe.py
+
+      - name: Download pinned model and tokenizer
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p models/bonsai2 models/qwen-official
+          MODEL="models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+          MODEL_URL="https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/6ed5e12bf84b7a63069882c91dd9e9218647d17b/Ternary-Bonsai-2-27B-PTQ1_0.gguf?download=true"
+          MODEL_SHA="53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"
+          curl -fL --retry 10 --retry-all-errors -C - -o "$MODEL.part" "$MODEL_URL"
+          echo "$MODEL_SHA  $MODEL.part" | sha256sum -c -
+          mv "$MODEL.part" "$MODEL"
+
+          TOKENIZER="models/qwen-official/tokenizer.json"
+          TOKENIZER_URL="https://huggingface.co/Qwen/Qwen3.8-27B/resolve/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/tokenizer.json?download=true"
+          TOKENIZER_SHA="0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+          curl -fL --retry 10 --retry-all-errors -o "$TOKENIZER.part" "$TOKENIZER_URL"
+          echo "$TOKENIZER_SHA  $TOKENIZER.part" | sha256sum -c -
+          mv "$TOKENIZER.part" "$TOKENIZER"
+
+      - name: Save close load and resume
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python qwen38/bonsai2_chat_capsule_probe.py \
+            --model models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+            --native-lib work/capsule/libbonsai2_quant.so \
+            --state-lib work/capsule/libgdn_state.so \
+            --tokenizer-json models/qwen-official/tokenizer.json \
+            --threads 4 \
+            --tail 31 \
+            --max-new-tokens 12 \
+            --work-dir work/capsule/run \
+            --output work/capsule/result.json
+
+      - name: Drop large files
+        if: always()
+        shell: bash
+        run: |
+          rm -rf models/bonsai2 models/qwen-official
+          rm -f work/capsule/run/baseline-k3/decoder64.k3.bin
+          rm -f work/capsule/run/restored-k3/decoder64.k3.bin
+          rm -f work/capsule/run/chat-state.q38cap
+
+      - name: Upload compact evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai2-chat-capsule-result
+          path: work/capsule/result.json
+          if-no-files-found: warn
+          retention-days: 30
